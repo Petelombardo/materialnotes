@@ -1,0 +1,38 @@
+version: '3.8'
+
+services:
+  backend:
+    build: ./backend
+    environment:
+      - NODE_ENV=production
+      - PORT=3001
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    networks:
+      - app-network
+
+  frontend:
+    build: ./frontend
+    depends_on:
+      - backend
+    networks:
+      - app-network
+
+  nginx:
+    build: ./nginx
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+      - frontend
+    networks:
+      - app-network
+
+networks:
+  app-network:
+    driver: bridge
+
+volumes:
+  data:

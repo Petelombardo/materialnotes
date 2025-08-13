@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <link rel="icon" href="%PUBLIC_URL%/favicon.ico" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#1976d2" />
+    <meta name="description" content="Material Notes - A modern note-taking app with WYSIWYG editor, auto-save, and search functionality" />
+    
+    <!-- PWA Meta Tags -->
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+    <meta name="apple-mobile-web-app-title" content="Material Notes" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="msapplication-TileColor" content="#1976d2" />
+    <meta name="msapplication-tap-highlight" content="no" />
+    
+    <!-- PWA Manifest -->
+    <link rel="manifest" href="%PUBLIC_URL%/manifest.json" />
+    
+    <!-- Apple Touch Icons -->
+    <link rel="apple-touch-icon" href="%PUBLIC_URL%/icon-192.png" />
+    <link rel="apple-touch-icon" sizes="152x152" href="%PUBLIC_URL%/icon-152.png" />
+    <link rel="apple-touch-icon" sizes="180x180" href="%PUBLIC_URL%/icon-180.png" />
+    <link rel="apple-touch-icon" sizes="167x167" href="%PUBLIC_URL%/icon-167.png" />
+    
+    <!-- Splash Screen for iOS -->
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <link rel="apple-touch-startup-image" href="%PUBLIC_URL%/splash-640x1136.png" media="(device-width: 320px) and (device-height: 568px) and (-webkit-device-pixel-ratio: 2)" />
+    <link rel="apple-touch-startup-image" href="%PUBLIC_URL%/splash-750x1334.png" media="(device-width: 375px) and (device-height: 667px) and (-webkit-device-pixel-ratio: 2)" />
+    <link rel="apple-touch-startup-image" href="%PUBLIC_URL%/splash-1242x2208.png" media="(device-width: 414px) and (device-height: 736px) and (-webkit-device-pixel-ratio: 3)" />
+    
+    <title>Material Notes</title>
+    
+    <!-- Google Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&display=swap" rel="stylesheet">
+    
+    <style>
+      /* Custom styles for ReactQuill editor */
+
+/* Replace the MDEditor styles in your index.html with this CORRECT version: */
+
+/* Replace the MDEditor styles in your index.html with this CORRECT version: */
+
+/* The correct CSS classes for MDEditor font sizing */
+body .w-md-editor-text-pre > code, 
+body .w-md-editor-text-input { 
+  font-size: 18px !important; 
+  line-height: 1.6 !important; 
+  font-family: "Roboto", "Helvetica", "Arial", sans-serif !important;
+}
+
+/* Also target the preview area */
+.wmde-markdown {
+  font-size: 18px !important;
+  line-height: 1.6 !important;
+  font-family: "Roboto", "Helvetica", "Arial", sans-serif !important;
+}
+
+/* Mobile adjustments */
+@media (max-width: 600px) {
+  body .w-md-editor-text-pre > code, 
+  body .w-md-editor-text-input,
+  .wmde-markdown {
+    font-size: 17px !important;
+  }
+}
+
+/* Larger screens */
+@media (min-width: 1200px) {
+  body .w-md-editor-text-pre > code, 
+  body .w-md-editor-text-input,
+  .wmde-markdown {
+    font-size: 19px !important;
+  }
+}
+      .ql-editor {
+        font-size: 16px !important;
+        line-height: 1.6 !important;
+        font-family: 'Roboto', 'Helvetica', 'Arial', sans-serif !important;
+      }
+      
+      .ql-editor h1 {
+        font-size: 2rem !important;
+      }
+      
+      .ql-editor h2 {
+        font-size: 1.75rem !important;
+      }
+      
+      .ql-editor h3 {
+        font-size: 1.5rem !important;
+      }
+      
+      .ql-toolbar {
+        border-top: 1px solid #ccc !important;
+        border-left: 1px solid #ccc !important;
+        border-right: 1px solid #ccc !important;
+      }
+      
+      .ql-container {
+        border-bottom: 1px solid #ccc !important;
+        border-left: 1px solid #ccc !important;
+        border-right: 1px solid #ccc !important;
+      }
+      
+      /* PWA Loading Screen */
+      #pwa-loading {
+        position: fixed;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        background: #f5f5f5;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        z-index: 9999;
+        font-family: 'Roboto', sans-serif;
+      }
+      
+      #pwa-loading .logo {
+        width: 80px;
+        height: 80px;
+        background: #1976d2;
+        border-radius: 16px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        color: white;
+        font-size: 24px;
+        font-weight: 500;
+        margin-bottom: 16px;
+      }
+      
+      #pwa-loading .spinner {
+        width: 40px;
+        height: 40px;
+        border: 4px solid #e0e0e0;
+        border-top: 4px solid #1976d2;
+        border-radius: 50%;
+        animation: spin 1s linear infinite;
+      }
+      
+      @keyframes spin {
+        0% { transform: rotate(0deg); }
+        100% { transform: rotate(360deg); }
+      }
+    </style>
+  </head>
+  <body>
+    <noscript>You need to enable JavaScript to run this app.</noscript>
+    
+    <!-- PWA Loading Screen -->
+    <div id="pwa-loading">
+      <div class="logo">📝</div>
+      <h2 style="color: #1976d2; margin: 0 0 16px 0;">Material Notes</h2>
+      <div class="spinner"></div>
+    </div>
+    
+    <div id="root"></div>
+    
+    <script>
+      // Register service worker
+      if ('serviceWorker' in navigator) {
+        window.addEventListener('load', () => {
+          navigator.serviceWorker.register('/sw.js')
+            .then((registration) => {
+              console.log('SW registered: ', registration);
+            })
+            .catch((registrationError) => {
+              console.log('SW registration failed: ', registrationError);
+            });
+        });
+      }
+      
+      // Hide loading screen when React app loads
+      window.addEventListener('load', () => {
+        setTimeout(() => {
+          const loading = document.getElementById('pwa-loading');
+          if (loading) {
+            loading.style.display = 'none';
+          }
+        }, 1000);
+      });
+      
+      // PWA Install prompt
+      let deferredPrompt;
+      window.addEventListener('beforeinstallprompt', (e) => {
+        e.preventDefault();
+        deferredPrompt = e;
+        
+        // Show custom install button/banner
+        const installBanner = document.createElement('div');
+        installBanner.innerHTML = `
+          <div style="position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: #1976d2; color: white; padding: 12px 20px; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.15); z-index: 1000; font-family: Roboto, sans-serif;">
+            <span style="margin-right: 12px;">📱 Install Material Notes for the best experience!</span>
+            <button id="install-btn" style="background: white; color: #1976d2; border: none; padding: 6px 12px; border-radius: 4px; cursor: pointer; font-weight: 500;">Install</button>
+            <button id="dismiss-btn" style="background: transparent; color: white; border: 1px solid white; padding: 6px 12px; border-radius: 4px; cursor: pointer; margin-left: 8px;">Later</button>
+          </div>
+        `;
+        document.body.appendChild(installBanner);
+        
+        document.getElementById('install-btn').addEventListener('click', () => {
+          deferredPrompt.prompt();
+          deferredPrompt.userChoice.then((choiceResult) => {
+            if (choiceResult.outcome === 'accepted') {
+              console.log('User accepted the install prompt');
+            }
+            deferredPrompt = null;
+            installBanner.remove();
+          });
+        });
+        
+        document.getElementById('dismiss-btn').addEventListener('click', () => {
+          installBanner.remove();
+        });
+      });
+    </script>
+  </body>
+</html>
