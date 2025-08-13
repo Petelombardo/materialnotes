@@ -15,7 +15,7 @@ A modern note-taking application with WYSIWYG editing, auto-save, and multi-user
 ## Project Structure
 
 ```
-material-notes/
+materialnotes/
 ├── docker-compose.yml
 ├── backend/
 │   ├── Dockerfile
@@ -85,9 +85,8 @@ PORT=3001
 
 ```bash
 # Clone/create the project directory
-mkdir material-notes && cd material-notes
+git clone https://github.com/Petelombardo/materialnotes.git
 
-# Create all the files (see project structure above)
 # Add your .env file with the required environment variables
 
 # Build and run the application
