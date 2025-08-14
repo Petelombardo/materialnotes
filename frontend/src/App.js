@@ -56,15 +56,19 @@ function App() {
   const [mobileView, setMobileView] = useState('list'); // 'list' or 'editor'
   const [pendingSave, setPendingSave] = useState(null);
   
+  // NEW: Auto-refresh state
+  const [notesTimestamps, setNotesTimestamps] = useState(new Map());
+  const [refreshIntervalId, setRefreshIntervalId] = useState(null);
+  
   // Responsive breakpoints
   const theme = useTheme();
   const isMobile = useMediaQuery(theme.breakpoints.down('md'), {
-    defaultMatches: false, // Always default to desktop view
-    noSsr: true, // Disable server-side rendering conflicts
+    defaultMatches: false,
+    noSsr: true,
   });
   const isTablet = useMediaQuery(theme.breakpoints.between('md', 'lg'));
 
-  // Helper functions FIRST (before they're used)
+  // Helper functions (unchanged)
   const saveTemporaryNotesToStorage = (notes) => {
     const tempNotes = notes.filter(note => note.id.startsWith('temp_'));
     localStorage.setItem('tempNotes', JSON.stringify(tempNotes));
@@ -99,17 +103,125 @@ function App() {
     }
   };
 
-  // Main functions
-  const loadNotes = async () => {
+  // NEW: Check for note updates based on timestamps
+  const checkForNoteUpdates = async (silent = true) => {
+    if (!user || !isOnline) {
+      if (!silent) console.log('🔍 Skipping note updates check - user:', !!user, 'online:', isOnline);
+      return;
+    }
+    
     try {
+      if (!silent) console.log('🔍 Checking for note updates...');
+      
       const response = await api.get('/api/notes');
       const serverNotes = response.data || [];
       
       const temporaryNotes = loadTemporaryNotesFromStorage();
       const allNotes = [...temporaryNotes, ...serverNotes];
       
+      // Check if any notes have been updated
+      let hasUpdates = false;
+      const newTimestamps = new Map();
+      const updatedNotes = [];
+      
+      allNotes.forEach(note => {
+        if (note.updatedAt) {
+          const newTime = new Date(note.updatedAt).getTime();
+          const oldTime = notesTimestamps.get(note.id);
+          newTimestamps.set(note.id, newTime);
+          
+          if (oldTime && newTime > oldTime) {
+            hasUpdates = true;
+            updatedNotes.push({
+              id: note.id,
+              title: note.title || 'Untitled',
+              shared: note.shared,
+              hasBeenShared: note.hasBeenShared,
+              lastEditor: note.lastEditorName || 'Unknown'
+            });
+            console.log('🔄 Note updated detected:', {
+              id: note.id,
+              title: note.title || 'Untitled',
+              shared: note.shared,
+              hasBeenShared: note.hasBeenShared,
+              oldTime: new Date(oldTime).toLocaleTimeString(),
+              newTime: new Date(newTime).toLocaleTimeString(),
+              lastEditor: note.lastEditorName || 'Unknown'
+            });
+          }
+        }
+      });
+      
+      // Update notes if there are changes or if this is the first load
+      if (hasUpdates || notesTimestamps.size === 0) {
+        setNotes(allNotes);
+        setNotesTimestamps(newTimestamps);
+        
+        if (hasUpdates) {
+          console.log('✅ Applied updates to', updatedNotes.length, 'notes:', updatedNotes);
+        }
+        
+        // Update selected note if it was changed
+        if (selectedNote) {
+          const updatedSelectedNote = allNotes.find(note => note.id === selectedNote.id);
+          if (updatedSelectedNote && updatedSelectedNote.updatedAt !== selectedNote.updatedAt) {
+            console.log('🔄 Updating selected note:', {
+              id: selectedNote.id,
+              title: selectedNote.title || 'Untitled',
+              oldTime: selectedNote.updatedAt,
+              newTime: updatedSelectedNote.updatedAt
+            });
+            setSelectedNote(updatedSelectedNote);
+          }
+        }
+        
+        if (hasUpdates && !silent) {
+          console.log('🔄 Notes updated from server');
+        }
+      } else {
+        if (!silent) console.log('✅ No note updates detected');
+      }
+      
+    } catch (error) {
+      if (!silent) {
+        console.error('❌ Failed to check for note updates:', error);
+      }
+    }
+  };
+
+  // Modified loadNotes to also set up timestamps
+  const loadNotes = async () => {
+    try {
+      const response = await api.get('/api/notes');
+      const serverNotes = response.data || [];
+      
+      console.log('📋 App.js loaded notes sample:', {
+        totalNotes: serverNotes.length,
+        firstNote: serverNotes[0] ? {
+          id: serverNotes[0].id,
+          title: serverNotes[0].title,
+          hasUpdatedAt: !!serverNotes[0].updatedAt,
+          updatedAt: serverNotes[0].updatedAt,
+          hasCreatedAt: !!serverNotes[0].createdAt,
+          createdAt: serverNotes[0].createdAt,
+          allKeys: Object.keys(serverNotes[0])
+        } : 'No notes'
+      });
+      
+      const temporaryNotes = loadTemporaryNotesFromStorage();
+      const allNotes = [...temporaryNotes, ...serverNotes];
+      
       setNotes(allNotes);
       setErrorMessage('');
+      
+      // Set up timestamps for future comparison
+      const timestamps = new Map();
+      allNotes.forEach(note => {
+        if (note.updatedAt) {
+          timestamps.set(note.id, new Date(note.updatedAt).getTime());
+        }
+      });
+      setNotesTimestamps(timestamps);
       
       console.log(`Loaded ${serverNotes.length} server notes and ${temporaryNotes.length} temporary notes`);
     } catch (error) {
@@ -124,6 +236,37 @@ function App() {
       if (!api.isNetworkError(error) && isOnline) {
         setErrorMessage('Failed to load notes. Please try again.');
       }
+    }
+  };
+
+  // NEW: Start automatic refresh for shared notes
+  const startAutoRefresh = () => {
+    if (refreshIntervalId) {
+      console.log('🛑 Stopping existing auto-refresh before starting new one');
+      clearInterval(refreshIntervalId);
+    }
+    
+    console.log('🚀 Starting auto-refresh for notes (every 10 seconds)');
+    
+    // Check for updates every 10 seconds
+    const intervalId = setInterval(() => {
+      console.log('⏰ Auto-refresh interval triggered');
+      checkForNoteUpdates(true);
+    }, 10000);
+    
+    setRefreshIntervalId(intervalId);
+    console.log('✅ Auto-refresh started with interval ID:', intervalId);
+  };
+
+  // NEW: Stop automatic refresh
+  const stopAutoRefresh = () => {
+    if (refreshIntervalId) {
+      console.log('🛑 Stopping auto-refresh, interval ID:', refreshIntervalId);
+      clearInterval(refreshIntervalId);
+      setRefreshIntervalId(null);
+      console.log('✅ Auto-refresh stopped');
+    } else {
+      console.log('ℹ️ No auto-refresh to stop (interval ID was null)');
     }
   };
 
@@ -192,6 +335,7 @@ function App() {
           console.log('Triggering sync after coming online...');
           await syncTemporaryNotes();
           await loadNotes();
+          startAutoRefresh(); // NEW: Start auto-refresh when coming online
         } catch (error) {
           console.error('Failed to sync temporary notes:', error);
         }
@@ -201,6 +345,7 @@ function App() {
     const handleBrowserOffline = () => {
       console.log('Browser detected: offline');
       setIsOnline(false);
+      stopAutoRefresh(); // NEW: Stop auto-refresh when going offline
     };
 
     window.addEventListener('online', handleBrowserOnline);
@@ -219,6 +364,7 @@ function App() {
           console.log('API online - triggering sync...');
           await syncTemporaryNotes();
           await loadNotes();
+          startAutoRefresh(); // NEW: Start auto-refresh when API comes online
         } catch (error) {
           console.error('Failed to sync temporary notes:', error);
         }
@@ -228,6 +374,7 @@ function App() {
     api.addEventListener('offline', () => {
       console.log('API detected: offline');
       setIsOnline(false);
+      stopAutoRefresh(); // NEW: Stop auto-refresh when API goes offline
     });
     
     api.addEventListener('sync-start', () => setSyncInProgress(true));
@@ -262,9 +409,11 @@ function App() {
     return () => {
       window.removeEventListener('online', handleBrowserOnline);
       window.removeEventListener('offline', handleBrowserOffline);
+      stopAutoRefresh(); // NEW: Clean up auto-refresh
     };
   };
 
+  // Rest of the component remains largely the same...
   const createNote = async () => {
     try {
       if (pendingSave && selectedNote) {
@@ -305,6 +454,13 @@ function App() {
       const newNote = response.data;
       setNotes([newNote, ...notes]);
       setSelectedNote(newNote);
+      
+      // Update timestamps
+      setNotesTimestamps(prev => {
+        const updated = new Map(prev);
+        updated.set(newNote.id, new Date(newNote.updatedAt).getTime());
+        return updated;
+      });
       
       if (isMobile) {
         setMobileView('editor');
@@ -375,6 +531,14 @@ function App() {
       if (selectedNote && selectedNote.id === id) {
         setSelectedNote(updatedNote);
       }
+      
+      // Update timestamps
+      setNotesTimestamps(prev => {
+        const updated = new Map(prev);
+        updated.set(updatedNote.id, new Date(updatedNote.updatedAt).getTime());
+        return updated;
+      });
+      
       setErrorMessage('');
     } catch (error) {
       console.error('Failed to update note:', error);
@@ -415,6 +579,14 @@ function App() {
           setMobileView('list');
         }
       }
+      
+      // Remove from timestamps
+      setNotesTimestamps(prev => {
+        const updated = new Map(prev);
+        updated.delete(id);
+        return updated;
+      });
+      
       setErrorMessage('');
     } catch (error) {
       console.error('Failed to delete note:', error);
@@ -456,10 +628,11 @@ function App() {
       if (cleanupOfflineListeners) {
         cleanupOfflineListeners();
       }
+      stopAutoRefresh(); // NEW: Clean up auto-refresh on unmount
     };
   }, []);
 
-  // Event handlers
+  // Event handlers (unchanged except for adding auto-refresh management)
   const handleNoteSelect = async (note) => {
     if (pendingSave && selectedNote) {
       try {
@@ -469,6 +642,19 @@ function App() {
         console.error('Failed to save before switching notes:', error);
       }
     }
+    
+    console.log('📋 App.js selecting note for NoteEditor:', {
+      noteId: note.id,
+      title: note.title || 'Untitled',
+      hasUpdatedAt: !!note.updatedAt,
+      updatedAt: note.updatedAt,
+      typeOfUpdatedAt: typeof note.updatedAt,
+      hasCreatedAt: !!note.createdAt,
+      createdAt: note.createdAt,
+      shared: note.shared,
+      hasBeenShared: note.hasBeenShared,
+      fullNoteKeys: Object.keys(note)
+    });
     
     setSelectedNote(note);
     
@@ -547,6 +733,11 @@ function App() {
         setUser(userData);
         await loadNotes();
         
+        // NEW: Start auto-refresh after successful authentication and loading notes
+        if (isOnline) {
+          startAutoRefresh();
+        }
+        
         const urlParams = new URLSearchParams(window.location.search);
         if (urlParams.get('action') === 'new') {
           setTimeout(() => createNote(), 500);
@@ -562,6 +753,9 @@ function App() {
               console.log('Second attempt successful:', userData2.email);
               setUser(userData2);
               await loadNotes();
+              if (isOnline) {
+                startAutoRefresh();
+              }
             } else {
               console.log('Second attempt also failed, clearing auth');
               await handleAuthFailure();
@@ -593,6 +787,7 @@ function App() {
   };
 
   const handleAuthFailure = async () => {
+    stopAutoRefresh(); // NEW: Stop auto-refresh on auth failure
     localStorage.removeItem('token');
     delete api.api.defaults.headers.common['Authorization'];
     await api.clearAuthData();
@@ -610,6 +805,7 @@ function App() {
       console.error('Logout request failed:', error);
     }
     
+    stopAutoRefresh(); // NEW: Stop auto-refresh on logout
     localStorage.removeItem('token');
     delete api.api.defaults.headers.common['Authorization'];
     await api.clearAuthData();
@@ -618,6 +814,7 @@ function App() {
     setSelectedNote(null);
     setAnchorEl(null);
     setMobileView('list');
+    setNotesTimestamps(new Map()); // NEW: Clear timestamps
   };
 
   const handleSyncNow = async () => {
@@ -627,6 +824,9 @@ function App() {
         if (!success) {
           setErrorMessage('Sync failed. Please check your connection.');
           setShowErrorDialog(true);
+        } else {
+          // Force a refresh after manual sync
+          await checkForNoteUpdates(false);
         }
       } catch (error) {
         console.error('Manual sync failed:', error);
@@ -658,6 +858,7 @@ function App() {
     return isOnline ? 'Online' : 'Offline';
   };
 
+  // Rest of the render logic remains the same...
   if (loading) {
     return (
       <Box display="flex" justifyContent="center" alignItems="center" minHeight="100vh">
@@ -843,6 +1044,7 @@ function App() {
                 onDeleteNote={deleteNote}
                 onCreateNote={createNote}
                 isMobile={isMobile}
+                currentUser={user}
               />
             </Box>
           )}
@@ -867,6 +1069,7 @@ function App() {
                 onUpdateNote={handleNoteUpdate}
                 onBack={handleBackToList}
                 isMobile={isMobile}
+                currentUser={user}
               />
             </Box>
           )}

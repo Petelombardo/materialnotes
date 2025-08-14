@@ -303,15 +303,16 @@ class OfflineCapableAPI {
     document.dispatchEvent(customEvent);
   }
 
-  // Get notes - works offline with retry logic
+// Get notes - works offline with retry logic
   async get(url) {
     if (url === '/api/notes') {
       return this.getNotes();
-    } else if (url.startsWith('/api/notes/')) {
+    } else if (url.match(/^\/api\/notes\/[^\/]+$/)) {
+      // Only match single note URLs like /api/notes/{noteId} (no additional path segments)
       const noteId = url.split('/').pop();
       return this.getNote(noteId);
     } else {
-      // For other endpoints, try online first with retry
+      // For other endpoints (including collaboration endpoints), try online first with retry
       if (this.isOnline) {
         try {
           return await this.retryRequest(() => this.api.get(url));

@@ -18,7 +18,10 @@ import {
   DialogActions,
   Button,
   CircularProgress,
-  LinearProgress
+  LinearProgress,
+  Avatar,
+  AvatarGroup,
+  Collapse
 } from '@mui/material';
 import {
   Share as ShareIcon,
@@ -41,7 +44,10 @@ import {
   Undo as UndoIcon,
   Redo as RedoIcon,
   Image as ImageIcon,
-  CloudUpload as UploadIcon
+  CloudUpload as UploadIcon,
+  Sync as SyncIcon,
+  ExpandLess as ExpandLessIcon,
+  ExpandMore as ExpandMoreIcon
 } from '@mui/icons-material';
 import { useEditor, EditorContent } from '@tiptap/react';
 import StarterKit from '@tiptap/starter-kit';
@@ -54,7 +60,8 @@ import TaskItem from '@tiptap/extension-task-item';
 import api from '../utils/api';
 import ShareNoteDialog from './ShareNoteDialog';
 
-const NoteEditor = ({ note, onUpdateNote, onBack, isMobile = false }) => {
+const NoteEditor = ({ note, onUpdateNote, onBack, isMobile = false, currentUser }) => {
+  // ===== STATE DECLARATIONS =====
   const [title, setTitle] = useState('');
   const [lastSaved, setLastSaved] = useState(null);
   const [saving, setSaving] = useState(false);
@@ -72,7 +79,16 @@ const NoteEditor = ({ note, onUpdateNote, onBack, isMobile = false }) => {
   const [uploadProgress, setUploadProgress] = useState(0);
   const [dragOver, setDragOver] = useState(false);
   
-  // Track current note and initial values
+  // Collaboration state
+  const [activeEditors, setActiveEditors] = useState([]);
+  const [hasRemoteChanges, setHasRemoteChanges] = useState(false);
+  const [lastUpdateTimestamp, setLastUpdateTimestamp] = useState(null);
+  const [conflictDialogOpen, setConflictDialogOpen] = useState(false);
+  const [pendingRemoteUpdate, setPendingRemoteUpdate] = useState(null);
+  const [showCollaborationAlert, setShowCollaborationAlert] = useState(true);
+  const [syncingChanges, setSyncingChanges] = useState(false);
+
+  // ===== REF DECLARATIONS =====
   const currentNoteId = useRef(null);
   const initialValues = useRef({ title: '', content: '' });
   const saveTimeoutRef = useRef(null);
@@ -82,8 +98,15 @@ const NoteEditor = ({ note, onUpdateNote, onBack, isMobile = false }) => {
   const userInteractedRef = useRef(false);
   const fileInputRef = useRef(null);
   const dragCounterRef = useRef(0);
+  const pollIntervalRef = useRef(null);
+  const presenceIntervalRef = useRef(null);
+  const lastLocalUpdateRef = useRef(null);
+  const collaborationActiveRef = useRef(false);
+  const sharedNotePollIntervalRef = useRef(null);
+  const noteTimestampRef = useRef(null);
+  const applyingRemoteChangesRef = useRef(false);
 
-  // Tiptap editor configuration with image support
+  // ===== EDITOR SETUP =====
   const editor = useEditor({
     extensions: [
       StarterKit.configure({
@@ -123,8 +146,11 @@ const NoteEditor = ({ note, onUpdateNote, onBack, isMobile = false }) => {
     content: '',
     editable: true,
     onUpdate: ({ editor }) => {
-      if (!isInitializing && editorReadyRef.current) {
+      if (!isInitializing && editorReadyRef.current && !applyingRemoteChangesRef.current) {
+        console.log('👤 User interaction detected (not remote update)');
         userInteractedRef.current = true;
+      } else if (applyingRemoteChangesRef.current) {
+        console.log('🔄 Ignoring programmatic content update (remote changes)');
       }
     },
     editorProps: {
@@ -141,34 +167,15 @@ const NoteEditor = ({ note, onUpdateNote, onBack, isMobile = false }) => {
         `,
         class: 'tiptap-editor-content',
       },
-      handleDrop: (view, event, slice, moved) => {
-        // We'll define handleMultipleFiles later, so we'll handle this in the effect
-        if (event.dataTransfer && event.dataTransfer.files.length > 0) {
-          const files = Array.from(event.dataTransfer.files);
-          const imageFiles = files.filter(file => file.type.startsWith('image/'));
-          
-          if (imageFiles.length > 0) {
-            event.preventDefault();
-            // This will be handled by the effect
-            return true;
-          }
-        }
-        return false;
-      },
-      handlePaste: (view, event, slice) => {
-        // This will be handled by the effect
-        return false;
-      },
     },
   });
 
-  // Get current editor content - MOVED BEFORE OTHER CALLBACKS
+  // ===== UTILITY FUNCTIONS =====
   const getCurrentContent = useCallback(() => {
     if (!editor) return '';
     return editor.getHTML();
   }, [editor]);
 
-  // Basic event handlers - MOVED BEFORE OTHER CALLBACKS
   const handleUserInteraction = useCallback(() => {
     if (!isInitializing && editorReadyRef.current) {
       userInteractedRef.current = true;
@@ -187,9 +194,13 @@ const NoteEditor = ({ note, onUpdateNote, onBack, isMobile = false }) => {
     }
   }, [title, handleUserInteraction]);
 
-  // Change detection - NOW AFTER getCurrentContent IS DEFINED
   const checkForChanges = useCallback(() => {
     if (!note || !editorReadyRef.current || isInitializing || !userInteractedRef.current || !editor) {
+      return false;
+    }
+
+    if (applyingRemoteChangesRef.current) {
+      console.log('🔄 Skipping change detection - applying remote changes');
       return false;
     }
 
@@ -201,26 +212,199 @@ const NoteEditor = ({ note, onUpdateNote, onBack, isMobile = false }) => {
     const initialContent = initialValues.current.content || '';
     const contentChanged = currentContent !== initialContent;
     
-    return titleChanged || contentChanged;
+    const hasChanges = titleChanged || contentChanged;
+    
+    if (hasChanges) {
+      console.log('📝 Local changes detected:', {
+        titleChanged,
+        contentChanged,
+        currentTitle: currentTitle.substring(0, 50) + '...',
+        initialTitle: initialTitle.substring(0, 50) + '...',
+        currentContentLength: currentContent?.length || 0,
+        initialContentLength: initialContent?.length || 0
+      });
+    }
+    
+    return hasChanges;
   }, [note, title, isInitializing, getCurrentContent, editor]);
 
-  // Save function - NOW AFTER getCurrentContent IS DEFINED
+  // ===== COLLABORATION FUNCTIONS =====
+  const stopActiveCollaborationPolling = useCallback(() => {
+    if (!collaborationActiveRef.current) {
+      console.log('ℹ️ High-frequency polling not active, nothing to stop');
+      return;
+    }
+    
+    collaborationActiveRef.current = false;
+    console.log('🛑 Stopping high-frequency collaboration polling');
+    
+    if (pollIntervalRef.current) {
+      clearInterval(pollIntervalRef.current);
+      pollIntervalRef.current = null;
+      console.log('✅ High-frequency polling stopped');
+    }
+  }, []);
+
+  const stopSharedNotePolling = useCallback(() => {
+    if (sharedNotePollIntervalRef.current) {
+      console.log('🛑 Stopping background polling for shared note');
+      clearInterval(sharedNotePollIntervalRef.current);
+      sharedNotePollIntervalRef.current = null;
+      console.log('✅ Background polling stopped');
+    } else {
+      console.log('ℹ️ No background polling to stop');
+    }
+  }, []);
+
+  const registerPresence = useCallback(async (action = 'join') => {
+    if (!note?.id || !currentUser) {
+      console.log('❌ Cannot register presence:', {
+        hasNoteId: !!note?.id,
+        hasCurrentUser: !!currentUser,
+        action
+      });
+      return;
+    }
+    
+    try {
+      console.log('📝 Registering presence:', {
+        action,
+        noteId: note.id,
+        userId: currentUser.id,
+        userName: currentUser.name
+      });
+      
+      console.log('🔗 Making API call to:', `/api/notes/${note.id}/presence`);
+      await api.post(`/api/notes/${note.id}/presence`, {
+        action,
+        editorInfo: {
+          name: currentUser?.name || 'Anonymous',
+          avatar: currentUser?.avatar,
+          id: currentUser?.id
+        }
+      });
+      console.log(`✅ Presence ${action} successful for note ${note.id}`);
+    } catch (error) {
+      console.error('❌ Failed to register presence:', error);
+      console.error('❌ Presence error details:', {
+        noteId: note?.id,
+        action,
+        url: `/api/notes/${note?.id}/presence`,
+        error: error.message
+      });
+    }
+  }, [note?.id, currentUser]);
+
+  const startActiveCollaborationPolling = useCallback(() => {
+    if (collaborationActiveRef.current) {
+      console.log('⭐ High-frequency polling already active, skipping');
+      return;
+    }
+    
+    collaborationActiveRef.current = true;
+    console.log('🚀 Starting high-frequency collaboration polling (every 5 seconds)');
+    
+    // Reduce frequency to prevent rate limiting
+    pollIntervalRef.current = setInterval(() => {
+      console.log('⏰ High-frequency polling interval triggered');
+      // checkForUpdates will be called here once it's defined
+    }, 5000);
+    
+  }, []);
+
+  const applyRemoteChanges = useCallback(({ content, title: remoteTitle, updatedAt }) => {
+    console.log('📝 Applying remote changes from', updatedAt, {
+      hasContent: !!content,
+      hasTitle: !!remoteTitle,
+      currentTitle: title,
+      currentContent: getCurrentContent()?.substring(0, 100) + '...'
+    });
+    
+    applyingRemoteChangesRef.current = true;
+    
+    try {
+      if (content && content !== getCurrentContent()) {
+        console.log('📝 Updating editor content');
+        editor?.commands.setContent(content);
+      }
+      
+      if (remoteTitle && remoteTitle !== title) {
+        console.log('📝 Updating title:', remoteTitle);
+        setTitle(remoteTitle);
+      }
+      
+      noteTimestampRef.current = updatedAt;
+      setLastUpdateTimestamp(prevTimestamp => {
+        console.log('🕐 Functional update of lastUpdateTimestamp:', {
+          prevTimestamp,
+          newTimestamp: updatedAt
+        });
+        return updatedAt;
+      });
+      setLastSaved(new Date(updatedAt));
+      setHasRemoteChanges(true);
+      
+      console.log('🕐 Updated timestamps after applying remote changes:', {
+        refTimestamp: noteTimestampRef.current,
+        stateWillBe: updatedAt
+      });
+      
+      const newInitialValues = { 
+        title: remoteTitle || title, 
+        content: content || getCurrentContent() 
+      };
+      initialValues.current = newInitialValues;
+      
+      console.log('🔄 Updated initial values after remote changes:', {
+        title: newInitialValues.title,
+        contentLength: newInitialValues.content?.length || 0
+      });
+      
+      userInteractedRef.current = false;
+      console.log('🔄 Reset user interaction flag - content now in sync');
+      
+      setTimeout(() => setHasRemoteChanges(false), 3000);
+      
+    } finally {
+      setTimeout(() => {
+        applyingRemoteChangesRef.current = false;
+        console.log('🔄 Remote changes application complete');
+      }, 100);
+    }
+    
+  }, [editor, getCurrentContent, title]);
+
   const saveNote = useCallback(async (noteId, updates) => {
     if (!noteId) return;
     
     setSaving(true);
+    lastLocalUpdateRef.current = Date.now();
+    
     try {
-      await onUpdateNote(noteId, updates);
+      const response = await onUpdateNote(noteId, updates);
+      const savedNote = response?.data || response;
+      
       setLastSaved(new Date());
       setHasUnsavedChanges(false);
       
-      // Update initial values with the current content
+      if (savedNote?.updatedAt) {
+        const newTimestamp = savedNote.updatedAt;
+        console.log('💾 Save successful, updating timestamps:', {
+          oldTimestamp: noteTimestampRef.current,
+          newTimestamp,
+          noteId
+        });
+        
+        noteTimestampRef.current = newTimestamp;
+        setLastUpdateTimestamp(newTimestamp);
+      }
+      
       initialValues.current = { 
         title: updates.title !== undefined ? updates.title : title,
         content: updates.content !== undefined ? updates.content : getCurrentContent()
       };
       
-      console.log('Save successful, updated initial values');
+      console.log('💾 Save successful, updated initial values');
       
     } catch (error) {
       console.error('Auto-save failed:', error);
@@ -234,7 +418,227 @@ const NoteEditor = ({ note, onUpdateNote, onBack, isMobile = false }) => {
     }
   }, [onUpdateNote, title, getCurrentContent]);
 
-  // Manual save for navigation - NOW AFTER saveNote IS DEFINED
+  const checkForUpdates = useCallback(async () => {
+    const effectiveTimestamp = lastUpdateTimestamp || noteTimestampRef.current;
+    
+    console.log('🔍 Update check details:', {
+      noteId: note?.id,
+      lastUpdateTimestamp,
+      noteTimestampRef: noteTimestampRef.current,
+      effectiveTimestamp,
+      syncingChanges,
+      hasNoteId: !!note?.id,
+      hasTimestamp: !!effectiveTimestamp,
+      timestampValue: effectiveTimestamp,
+      applyingRemoteChanges: applyingRemoteChangesRef.current
+    });
+    
+    if (!note?.id || !effectiveTimestamp || syncingChanges || applyingRemoteChangesRef.current) {
+      console.log('⭐ Skipping update check:', {
+        hasNoteId: !!note?.id,
+        hasTimestamp: !!effectiveTimestamp,
+        syncingChanges,
+        applyingRemoteChanges: applyingRemoteChangesRef.current,
+        reason: !note?.id ? 'no noteId' : !effectiveTimestamp ? 'no timestamp' : syncingChanges ? 'syncing in progress' : 'applying remote changes'
+      });
+      return;
+    }
+    
+    try {
+      console.log('🔍 Checking for remote updates:', {
+        noteId: note.id,
+        title: note.title || 'Untitled',
+        since: effectiveTimestamp,
+        url: `/api/notes/${note.id}/updates?since=${effectiveTimestamp}`
+      });
+      
+      setSyncingChanges(true);
+      const response = await api.get(`/api/notes/${note.id}/updates?since=${effectiveTimestamp}`);
+      const { content, title: remoteTitle, updatedAt, lastEditor } = response.data;
+      
+      console.log('📥 Update check response:', {
+        hasContent: !!content,
+        hasTitle: !!remoteTitle,
+        updatedAt,
+        lastEditor: lastEditor?.name || 'Unknown',
+        responseUpdatedAt: updatedAt,
+        currentTimestamp: effectiveTimestamp,
+        serverResponseFull: response.data
+      });
+      
+      const timeSinceLocalUpdate = lastLocalUpdateRef.current ? Date.now() - lastLocalUpdateRef.current : Infinity;
+      if (lastEditor?.id === currentUser?.id && timeSinceLocalUpdate < 5000) {
+        console.log('⭐ Skipping own update (within 5 seconds):', {
+          lastEditor: lastEditor.name,
+          timeSince: timeSinceLocalUpdate + 'ms'
+        });
+        noteTimestampRef.current = updatedAt;
+        setLastUpdateTimestamp(updatedAt);
+        return;
+      }
+      
+      if (!updatedAt) {
+        console.log('⭐ No updatedAt in response');
+        return;
+      }
+      
+      const newTimestamp = new Date(updatedAt).getTime();
+      const currentTimestamp = new Date(effectiveTimestamp).getTime();
+      
+      if (newTimestamp <= currentTimestamp) {
+        console.log('⭐ No new changes detected:', {
+          newTimestamp: new Date(newTimestamp).toISOString(),
+          currentTimestamp: new Date(currentTimestamp).toISOString(),
+          difference: newTimestamp - currentTimestamp,
+          serverSays: 'No changes since this timestamp'
+        });
+        return;
+      }
+      
+      console.log('🔄 Remote changes detected:', { 
+        updatedAt, 
+        lastEditor: lastEditor?.name,
+        timeSinceLocal: timeSinceLocalUpdate + 'ms',
+        timestampDiff: newTimestamp - currentTimestamp + 'ms',
+        hasContent: !!content,
+        hasTitle: !!remoteTitle
+      });
+      
+      const hasLocalChanges = checkForChanges();
+      console.log('🔍 Local changes status:', { 
+        hasLocalChanges,
+        userInteracted: userInteractedRef.current,
+        applyingRemote: applyingRemoteChangesRef.current
+      });
+      
+      if (hasLocalChanges && !applyingRemoteChangesRef.current) {
+        console.log('⚠️ Conflict detected - showing resolution dialog');
+        setPendingRemoteUpdate({ content, title: remoteTitle, updatedAt, lastEditor });
+        setConflictDialogOpen(true);
+      } else {
+        console.log('✅ Applying remote changes directly (no conflict)');
+        applyRemoteChanges({ content, title: remoteTitle, updatedAt });
+      }
+      
+    } catch (error) {
+      if (error.response?.status === 429) {
+        console.log('⏸️ Rate limited - will retry later');
+        return;
+      }
+      
+      console.error('❌ Failed to check for updates:', error);
+      console.error('❌ Update check error details:', {
+        noteId: note?.id,
+        effectiveTimestamp,
+        errorMessage: error.message,
+        errorStatus: error.response?.status,
+        errorData: error.response?.data
+      });
+    } finally {
+      setSyncingChanges(false);
+    }
+  }, [note?.id, note?.title, lastUpdateTimestamp, currentUser?.id, checkForChanges, syncingChanges, applyRemoteChanges]);
+
+  // Update the polling interval to use checkForUpdates
+  useEffect(() => {
+    if (pollIntervalRef.current && collaborationActiveRef.current) {
+      clearInterval(pollIntervalRef.current);
+      pollIntervalRef.current = setInterval(() => {
+        console.log('⏰ High-frequency polling interval triggered');
+        checkForUpdates();
+      }, 5000);
+    }
+  }, [checkForUpdates]);
+
+  const checkActiveEditors = useCallback(async () => {
+    if (!note?.id) {
+      console.log('❌ Cannot check active editors - note.id is missing:', note);
+      return;
+    }
+    
+    try {
+      console.log('👥 Checking active editors for note:', {
+        noteId: note.id,
+        title: note.title || 'Untitled',
+        shared: note.shared,
+        hasBeenShared: note.hasBeenShared
+      });
+      
+      console.log('🔗 Making API call to:', `/api/notes/${note.id}/presence`);
+      const response = await api.get(`/api/notes/${note.id}/presence`);
+      const editors = response.data.activeEditors || [];
+      
+      const otherEditors = editors.filter(editor => editor.id !== currentUser?.id);
+      setActiveEditors(otherEditors);
+      
+      console.log('👥 Active editors found:', {
+        total: editors.length,
+        others: otherEditors.length,
+        editors: otherEditors.map(e => ({ id: e.id, name: e.name }))
+      });
+      
+      const wasActive = collaborationActiveRef.current;
+      const shouldBeActive = otherEditors.length > 0;
+      
+      console.log('📊 Collaboration polling state:', {
+        wasActive,
+        shouldBeActive,
+        willChange: shouldBeActive !== wasActive
+      });
+      
+      if (shouldBeActive && !wasActive) {
+        console.log(`🚀 ${otherEditors.length} other editors detected, starting high-frequency polling`);
+        startActiveCollaborationPolling();
+      } else if (!shouldBeActive && wasActive) {
+        console.log('🛑 No other editors detected, reducing to background polling');
+        stopActiveCollaborationPolling();
+      }
+      
+    } catch (error) {
+      if (error.response?.status === 429) {
+        console.log('⏸️ Active editors check rate limited');
+      } else {
+        console.error('❌ Failed to check active editors:', error);
+        console.error('❌ Error details:', {
+          noteId: note?.id,
+          url: `/api/notes/${note?.id}/presence`,
+          hasNote: !!note,
+          error: error.message
+        });
+      }
+    }
+  }, [note?.id, note?.title, note?.shared, note?.hasBeenShared, currentUser?.id, startActiveCollaborationPolling, stopActiveCollaborationPolling]);
+
+  const startSharedNotePolling = useCallback(() => {
+    if ((!note?.shared && !note?.hasBeenShared) || sharedNotePollIntervalRef.current) {
+      console.log('⭐ Skipping shared note polling:', {
+        shared: note?.shared,
+        hasBeenShared: note?.hasBeenShared,
+        alreadyPolling: !!sharedNotePollIntervalRef.current
+      });
+      return;
+    }
+    
+    console.log('🔄 Starting background polling for shared note:', {
+      noteId: note?.id,
+      title: note?.title || 'Untitled',
+      shared: note?.shared,
+      hasBeenShared: note?.hasBeenShared,
+      interval: '45 seconds'
+    });
+    
+    sharedNotePollIntervalRef.current = setInterval(() => {
+      console.log('⏰ Background polling interval triggered for shared note');
+      checkForUpdates();
+      
+      setTimeout(() => {
+        checkActiveEditors();
+      }, 2000);
+    }, 45000);
+    
+  }, [note?.shared, note?.hasBeenShared, note?.id, note?.title, checkForUpdates, checkActiveEditors]);
+
+  // ===== OTHER FUNCTIONS =====
   const handleManualSave = useCallback(async () => {
     if (!note || !editor) return;
     
@@ -258,13 +662,88 @@ const NoteEditor = ({ note, onUpdateNote, onBack, isMobile = false }) => {
     }
   }, [note, title, getCurrentContent, saveNote, editor]);
 
-  // Image upload function
+  const handleConflictResolution = useCallback(async (resolution) => {
+    if (!pendingRemoteUpdate) return;
+    
+    const { content: remoteContent, title: remoteTitle, updatedAt } = pendingRemoteUpdate;
+    
+    if (resolution === 'accept') {
+      applyRemoteChanges(pendingRemoteUpdate);
+      setHasUnsavedChanges(false);
+      
+    } else if (resolution === 'reject') {
+      setLastUpdateTimestamp(updatedAt);
+      
+    } else if (resolution === 'merge') {
+      const currentContent = getCurrentContent();
+      const currentTitle = title;
+      
+      const hasLocalTitleChanges = currentTitle !== initialValues.current.title;
+      const finalTitle = hasLocalTitleChanges ? currentTitle : remoteTitle;
+      
+      const finalContent = currentContent + '\n\n--- Remote changes ---\n' + remoteContent;
+      
+      setTitle(finalTitle);
+      editor?.commands.setContent(finalContent);
+      setLastUpdateTimestamp(updatedAt);
+      
+      setTimeout(() => {
+        saveNote(note.id, { title: finalTitle, content: finalContent });
+      }, 500);
+    }
+    
+    setConflictDialogOpen(false);
+    setPendingRemoteUpdate(null);
+    
+  }, [pendingRemoteUpdate, applyRemoteChanges, getCurrentContent, title, editor, saveNote, note?.id]);
+
+  // ===== IMAGE UPLOAD FUNCTIONS =====
+  const storeImageOffline = useCallback(async (file) => {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const tempId = `temp_img_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+        const imageData = {
+          id: tempId,
+          url: reader.result,
+          offline: true,
+          file: {
+            name: file.name,
+            size: file.size,
+            type: file.type,
+            lastModified: file.lastModified
+          },
+          fileData: reader.result,
+          noteId: note?.id,
+          createdAt: new Date().toISOString()
+        };
+
+        try {
+          const offlineImages = JSON.parse(localStorage.getItem('offlineImages') || '[]');
+          offlineImages.push(imageData);
+          localStorage.setItem('offlineImages', JSON.stringify(offlineImages));
+          
+          resolve({
+            url: reader.result,
+            width: null,
+            height: null,
+            offline: true,
+            id: tempId
+          });
+        } catch (storageError) {
+          reject(new Error('Failed to store image offline. Storage may be full.'));
+        }
+      };
+      reader.onerror = () => reject(new Error('Failed to read image file'));
+      reader.readAsDataURL(file);
+    });
+  }, [note?.id]);
+
   const uploadImage = useCallback(async (file) => {
     if (!note?.id) {
       throw new Error('No note selected');
     }
 
-    // Validate file
     if (file.size > 10 * 1024 * 1024) {
       throw new Error('Image must be smaller than 10MB');
     }
@@ -273,12 +752,10 @@ const NoteEditor = ({ note, onUpdateNote, onBack, isMobile = false }) => {
       throw new Error('File must be an image');
     }
 
-    // If offline, store image locally
     if (!navigator.onLine) {
       return await storeImageOffline(file);
     }
 
-    // Upload to server
     const formData = new FormData();
     formData.append('image', file);
 
@@ -310,114 +787,13 @@ const NoteEditor = ({ note, onUpdateNote, onBack, isMobile = false }) => {
       } else if (error.response?.status === 403) {
         throw new Error('No permission to upload images to this note.');
       } else if (error.code === 'NETWORK_ERROR' || !navigator.onLine) {
-        // Network error - store offline
         return await storeImageOffline(file);
       } else {
         throw new Error('Failed to upload image. Please try again.');
       }
     }
-  }, [note?.id]);
+  }, [note?.id, storeImageOffline]);
 
-  // Store image offline for later sync
-  const storeImageOffline = useCallback(async (file) => {
-    return new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = () => {
-        const tempId = `temp_img_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-        const imageData = {
-          id: tempId,
-          url: reader.result, // base64 data URL
-          offline: true,
-          file: {
-            name: file.name,
-            size: file.size,
-            type: file.type,
-            lastModified: file.lastModified
-          },
-          fileData: reader.result, // Store the actual file data
-          noteId: note?.id,
-          createdAt: new Date().toISOString()
-        };
-
-        // Store in localStorage for later upload
-        try {
-          const offlineImages = JSON.parse(localStorage.getItem('offlineImages') || '[]');
-          offlineImages.push(imageData);
-          localStorage.setItem('offlineImages', JSON.stringify(offlineImages));
-          
-          console.log('Stored image offline:', tempId);
-          
-          resolve({
-            url: reader.result,
-            width: null, // We'll get this when uploaded
-            height: null,
-            offline: true,
-            id: tempId
-          });
-        } catch (storageError) {
-          reject(new Error('Failed to store image offline. Storage may be full.'));
-        }
-      };
-      reader.onerror = () => reject(new Error('Failed to read image file'));
-      reader.readAsDataURL(file);
-    });
-  }, [note?.id]);
-
-  // Sync offline images when back online
-  const syncOfflineImages = useCallback(async () => {
-    if (!note?.id) return;
-    
-    try {
-      const offlineImages = JSON.parse(localStorage.getItem('offlineImages') || '[]');
-      const noteImages = offlineImages.filter(img => img.noteId === note.id);
-
-      if (noteImages.length === 0) return;
-
-      console.log(`Syncing ${noteImages.length} offline images for note ${note.id}`);
-
-      for (const imageData of noteImages) {
-        try {
-          // Convert base64 back to file
-          const response = await fetch(imageData.fileData);
-          const blob = await response.blob();
-          const file = new File([blob], imageData.file.name, { 
-            type: imageData.file.type,
-            lastModified: imageData.file.lastModified 
-          });
-
-          // Upload to server
-          const uploadResult = await uploadImage(file);
-          
-          if (!uploadResult.offline) {
-            // Update the image in the editor content
-            const content = editor?.getHTML();
-            if (content && content.includes(imageData.url)) {
-              const updatedContent = content.replace(
-                new RegExp(imageData.url.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'),
-                uploadResult.url
-              );
-              editor?.commands.setContent(updatedContent);
-              
-              // Trigger a save to persist the updated URLs
-              userInteractedRef.current = true;
-            }
-
-            // Remove from offline storage
-            const updatedOfflineImages = offlineImages.filter(img => img.id !== imageData.id);
-            localStorage.setItem('offlineImages', JSON.stringify(updatedOfflineImages));
-            
-            console.log(`Successfully synced offline image ${imageData.id} -> ${uploadResult.id}`);
-          }
-        } catch (error) {
-          console.error('Failed to sync offline image:', imageData.id, error);
-        }
-      }
-    } catch (error) {
-      console.error('Failed to sync offline images:', error);
-    }
-  }, [note?.id, uploadImage, editor]);
-
-  // Handle file selection and upload
   const handleImageUpload = useCallback(async (file) => {
     if (!file) return;
 
@@ -428,7 +804,6 @@ const NoteEditor = ({ note, onUpdateNote, onBack, isMobile = false }) => {
     try {
       const result = await uploadImage(file);
       
-      // Insert image into editor at current position
       editor?.chain().focus().setImage({
         src: result.url,
         alt: file.name,
@@ -438,10 +813,8 @@ const NoteEditor = ({ note, onUpdateNote, onBack, isMobile = false }) => {
 
       setImageUploadDialog(false);
       
-      // Show success message for offline uploads
       if (result.offline) {
         setImageError('');
-        // Could show a toast here about offline storage
       }
       
     } catch (error) {
@@ -452,7 +825,6 @@ const NoteEditor = ({ note, onUpdateNote, onBack, isMobile = false }) => {
     }
   }, [uploadImage, editor]);
 
-  // Handle multiple file uploads
   const handleMultipleFiles = useCallback(async (files) => {
     const imageFiles = Array.from(files).filter(file => file.type.startsWith('image/'));
     
@@ -468,12 +840,11 @@ const NoteEditor = ({ note, onUpdateNote, onBack, isMobile = false }) => {
 
     for (const file of imageFiles) {
       await handleImageUpload(file);
-      // Small delay between uploads
       await new Promise(resolve => setTimeout(resolve, 500));
     }
   }, [handleImageUpload]);
 
-  // Drag and drop handlers
+  // ===== DRAG AND DROP HANDLERS =====
   const handleDragEnter = useCallback((e) => {
     e.preventDefault();
     e.stopPropagation();
@@ -512,36 +883,17 @@ const NoteEditor = ({ note, onUpdateNote, onBack, isMobile = false }) => {
     }
   }, [handleMultipleFiles]);
 
-  // Paste handler
-  const handlePaste = useCallback((e) => {
-    const items = Array.from(e.clipboardData.items);
-    const imageItems = items.filter(item => item.type.startsWith('image/'));
-    
-    if (imageItems.length > 0) {
-      e.preventDefault();
-      
-      imageItems.forEach(item => {
-        const file = item.getAsFile();
-        if (file) {
-          handleImageUpload(file);
-        }
-      });
-    }
-  }, [handleImageUpload]);
-
-  // File input handler
   const handleFileInputChange = useCallback((event) => {
     const files = event.target.files;
     if (files && files.length > 0) {
       handleMultipleFiles(files);
-      // Reset file input
       if (fileInputRef.current) {
         fileInputRef.current.value = '';
       }
     }
   }, [handleMultipleFiles]);
 
-  // Navigation handlers
+  // ===== NAVIGATION HANDLERS =====
   const handleBack = useCallback(async () => {
     if (saveTimeoutRef.current) {
       clearTimeout(saveTimeoutRef.current);
@@ -554,7 +906,7 @@ const NoteEditor = ({ note, onUpdateNote, onBack, isMobile = false }) => {
     }
   }, [handleManualSave, onBack]);
 
-  // Toolbar handlers
+  // ===== TOOLBAR HANDLERS =====
   const handleBold = () => editor?.chain().focus().toggleBold().run();
   const handleItalic = () => editor?.chain().focus().toggleItalic().run();
   const handleUnderline = () => editor?.chain().focus().toggleUnderline().run();
@@ -579,7 +931,31 @@ const NoteEditor = ({ note, onUpdateNote, onBack, isMobile = false }) => {
     setImageError('');
   };
 
-  // Lock management (keeping the same as before)
+  // ===== LOCK MANAGEMENT =====
+  const releaseLock = useCallback(async (noteId) => {
+    if (!noteId) return;
+    
+    try {
+      await fetch(`${api.baseURL}/api/notes/${noteId}/lock`, {
+        method: 'DELETE',
+        headers: {
+          'Authorization': `Bearer ${localStorage.getItem('token')}`,
+          'Content-Type': 'application/json'
+        },
+        credentials: 'include'
+      });
+    } catch (error) {
+      console.error('Failed to release lock:', error);
+    } finally {
+      setIsLocked(false);
+      setLockError('');
+      if (lockExtensionIntervalRef.current) {
+        clearInterval(lockExtensionIntervalRef.current);
+        lockExtensionIntervalRef.current = null;
+      }
+    }
+  }, []);
+
   const acquireLock = useCallback(async (noteId) => {
     if (!noteId) return false;
     
@@ -637,39 +1013,29 @@ const NoteEditor = ({ note, onUpdateNote, onBack, isMobile = false }) => {
     }
   }, []);
 
-  const releaseLock = useCallback(async (noteId) => {
-    if (!noteId) return;
-    
-    try {
-      await fetch(`${api.baseURL}/api/notes/${noteId}/lock`, {
-        method: 'DELETE',
-        headers: {
-          'Authorization': `Bearer ${localStorage.getItem('token')}`,
-          'Content-Type': 'application/json'
-        },
-        credentials: 'include'
-      });
-    } catch (error) {
-      console.error('Failed to release lock:', error);
-    } finally {
-      setIsLocked(false);
-      setLockError('');
-      if (lockExtensionIntervalRef.current) {
-        clearInterval(lockExtensionIntervalRef.current);
-        lockExtensionIntervalRef.current = null;
-      }
-    }
-  }, []);
-
-  // Effects
-
+  // ===== EFFECTS =====
   // Reset state when note changes
   useEffect(() => {
     if (note && note.id !== currentNoteId.current) {
-      console.log('Loading new note:', note.id);
+      console.log('📝 Loading new note:', {
+        noteId: note.id,
+        title: note.title || 'Untitled',
+        shared: note.shared,
+        hasBeenShared: note.hasBeenShared,
+        sharedBy: note.sharedBy,
+        sharedWith: note.sharedWith,
+        permission: note.permission,
+        updatedAt: note.updatedAt,
+        createdAt: note.createdAt,
+        hasUpdatedAt: !!note.updatedAt,
+        typeOfUpdatedAt: typeof note.updatedAt
+      });
       
+      // Cleanup previous note
       if (currentNoteId.current) {
+        console.log('🧹 Cleaning up previous note:', currentNoteId.current);
         releaseLock(currentNoteId.current);
+        registerPresence('leave');
       }
       if (saveTimeoutRef.current) {
         clearTimeout(saveTimeoutRef.current);
@@ -679,6 +1045,8 @@ const NoteEditor = ({ note, onUpdateNote, onBack, isMobile = false }) => {
         clearTimeout(lockTimeoutRef.current);
         lockTimeoutRef.current = null;
       }
+      stopActiveCollaborationPolling();
+      stopSharedNotePolling();
       
       setIsInitializing(true);
       editorReadyRef.current = false;
@@ -686,15 +1054,27 @@ const NoteEditor = ({ note, onUpdateNote, onBack, isMobile = false }) => {
       
       const newTitle = note.title || '';
       const newContent = note.content || '';
+      const timestamp = note.updatedAt;
       
       currentNoteId.current = note.id;
       initialValues.current = { title: newTitle, content: newContent };
+      
+      noteTimestampRef.current = timestamp;
+      console.log('🕐 Set noteTimestampRef immediately:', timestamp);
       
       setTitle(newTitle);
       setLastSaved(new Date(note.updatedAt));
       setHasUnsavedChanges(false);
       setIsLocked(false);
       setLockError('');
+      
+      setLastUpdateTimestamp(prevTimestamp => {
+        console.log('🕐 Setting lastUpdateTimestamp with functional update:', {
+          prevTimestamp,
+          newTimestamp: timestamp
+        });
+        return timestamp;
+      });
       
       if (note.locked && note.lockedBy) {
         setLockOwner(note.lockedBy);
@@ -703,7 +1083,7 @@ const NoteEditor = ({ note, onUpdateNote, onBack, isMobile = false }) => {
         setLockOwner(null);
       }
       
-      // Set editor content after a brief delay to ensure editor is ready
+      // Set editor content after a brief delay
       if (editor) {
         setTimeout(() => {
           editor.commands.setContent(newContent || '');
@@ -712,19 +1092,53 @@ const NoteEditor = ({ note, onUpdateNote, onBack, isMobile = false }) => {
             setIsInitializing(false);
             editorReadyRef.current = true;
             
-            // Sync offline images when note loads (if online)
-            if (navigator.onLine) {
-              syncOfflineImages();
-            }
-            
-            // Final baseline setup
             setTimeout(() => {
               if (currentNoteId.current === note.id) {
                 initialValues.current = { 
                   title: newTitle, 
                   content: newContent
                 };
-                console.log('Note initialization complete with image support');
+                
+                // Initialize collaboration after state is stable
+                setTimeout(() => {
+                  console.log('📝 Collaboration setup check:', {
+                    hasCurrentUser: !!currentUser,
+                    currentUserId: currentUser?.id,
+                    currentUserName: currentUser?.name,
+                    noteId: note.id
+                  });
+                  
+                  if (currentUser) {
+                    console.log('🤝 Initializing collaboration for note:', note.id);
+                    registerPresence('join');
+                    checkActiveEditors();
+                    
+                    const isCollaborativeNote = note.shared || note.hasBeenShared;
+                    console.log('📝 Note collaboration status:', {
+                      shared: note.shared,
+                      hasBeenShared: note.hasBeenShared,
+                      isCollaborative: isCollaborativeNote
+                    });
+                    
+                    if (isCollaborativeNote) {
+                      startSharedNotePolling();
+                    } else {
+                      console.log('ℹ️ Note is not collaborative, skipping background polling');
+                    }
+                  } else {
+                    console.log('❌ No currentUser available, skipping collaboration setup');
+                  }
+                  
+                  // Final verification after everything is set up
+                  setTimeout(() => {
+                    console.log('✅ Note initialization complete with enhanced collaboration');
+                    console.log('🕐 Final timestamp verification:', {
+                      stateTimestamp: 'Will check in next render',
+                      refTimestamp: noteTimestampRef.current,
+                      hasEither: !!(noteTimestampRef.current)
+                    });
+                  }, 100);
+                }, 200);
               }
             }, 200);
           }, 100);
@@ -732,8 +1146,11 @@ const NoteEditor = ({ note, onUpdateNote, onBack, isMobile = false }) => {
       }
       
     } else if (!note) {
+      console.log('🗑️ No note selected, cleaning up');
+      // Cleanup when no note
       if (currentNoteId.current) {
         releaseLock(currentNoteId.current);
+        registerPresence('leave');
       }
       if (saveTimeoutRef.current) {
         clearTimeout(saveTimeoutRef.current);
@@ -743,25 +1160,84 @@ const NoteEditor = ({ note, onUpdateNote, onBack, isMobile = false }) => {
         clearTimeout(lockTimeoutRef.current);
         lockTimeoutRef.current = null;
       }
+      stopActiveCollaborationPolling();
+      stopSharedNotePolling();
       
       setTitle('');
       if (editor) {
         editor.commands.setContent('');
       }
       setLastSaved(null);
+      setLastUpdateTimestamp(null);
+      noteTimestampRef.current = null;
       setHasUnsavedChanges(false);
       setIsLocked(false);
       setLockError('');
       setLockOwner(null);
       setIsInitializing(false);
+      setActiveEditors([]);
       initialValues.current = { title: '', content: '' };
       currentNoteId.current = null;
       editorReadyRef.current = false;
       userInteractedRef.current = false;
     }
-  }, [note, releaseLock, editor, syncOfflineImages]);
+  }, [
+    note, 
+    releaseLock, 
+    editor, 
+    registerPresence, 
+    checkActiveEditors, 
+    stopActiveCollaborationPolling, 
+    stopSharedNotePolling, 
+    startSharedNotePolling, 
+    currentUser
+  ]);
 
-  // Watch for editor content changes
+  // Verify timestamp state is set
+  useEffect(() => {
+    if (lastUpdateTimestamp) {
+      console.log('🕐 lastUpdateTimestamp state successfully updated:', lastUpdateTimestamp);
+    }
+  }, [lastUpdateTimestamp]);
+
+  // Enhanced presence checking for shared notes
+  useEffect(() => {
+    if (note?.id && currentUser) {
+      const isCollaborativeNote = note.shared || note.hasBeenShared;
+      const checkInterval = isCollaborativeNote ? 20000 : 60000;
+      
+      console.log('⏰ Setting up presence checking:', {
+        noteId: note.id,
+        title: note.title || 'Untitled',
+        shared: note.shared,
+        hasBeenShared: note.hasBeenShared,
+        isCollaborative: isCollaborativeNote,
+        checkInterval: checkInterval + 'ms'
+      });
+      
+      presenceIntervalRef.current = setInterval(async () => {
+        console.log('⏰ Presence check interval triggered');
+        try {
+          await checkActiveEditors();
+        } catch (error) {
+          if (error.response?.status === 429) {
+            console.log('⏸️ Presence check rate limited - will retry later');
+          } else {
+            console.error('❌ Presence check failed:', error);
+          }
+        }
+      }, checkInterval);
+      
+      return () => {
+        if (presenceIntervalRef.current) {
+          console.log('🛑 Cleaning up presence checking interval');
+          clearInterval(presenceIntervalRef.current);
+        }
+      };
+    }
+  }, [note?.id, note?.shared, note?.hasBeenShared, note?.title, currentUser, checkActiveEditors]);
+
+  // Watch for editor content changes and auto-save
   useEffect(() => {
     if (isInitializing || !editorReadyRef.current || !userInteractedRef.current || !editor) {
       return;
@@ -770,13 +1246,9 @@ const NoteEditor = ({ note, onUpdateNote, onBack, isMobile = false }) => {
     if (note && currentNoteId.current === note.id) {
       const hasChanges = checkForChanges();
       
-      if (hasChanges) {
-        console.log('Real changes detected by user interaction');
-      }
-      
       setHasUnsavedChanges(hasChanges);
       
-      if (hasChanges) {
+      if (hasChanges && !applyingRemoteChangesRef.current) {
         if (!isLocked && !lockOwner && note.permission === 'edit') {
           acquireLock(note.id);
         }
@@ -787,6 +1259,12 @@ const NoteEditor = ({ note, onUpdateNote, onBack, isMobile = false }) => {
           }
           
           saveTimeoutRef.current = setTimeout(() => {
+            if (applyingRemoteChangesRef.current) {
+              console.log('🔄 Skipping auto-save - applying remote changes');
+              saveTimeoutRef.current = null;
+              return;
+            }
+            
             const updates = {};
             const currentTitle = title || '';
             const initialTitle = initialValues.current.title || '';
@@ -801,11 +1279,11 @@ const NoteEditor = ({ note, onUpdateNote, onBack, isMobile = false }) => {
             }
             
             if (Object.keys(updates).length > 0) {
-              console.log('Auto-saving real changes:', updates);
+              console.log('💾 Auto-saving changes:', updates);
               saveNote(note.id, updates);
             }
             saveTimeoutRef.current = null;
-          }, 2000);
+          }, 3000);
         }
       } else {
         if (isLocked) {
@@ -857,71 +1335,25 @@ const NoteEditor = ({ note, onUpdateNote, onBack, isMobile = false }) => {
     };
   }, [editor, handleDragEnter, handleDragLeave, handleDragOver, handleDrop]);
 
-  // Update editor props to use the properly defined handlers
-  useEffect(() => {
-    if (editor) {
-      editor.setOptions({
-        editorProps: {
-          attributes: {
-            style: `
-              padding: ${isMobile ? '12px' : '16px'}; 
-              font-size: 18px; 
-              line-height: 1.6; 
-              font-family: "Roboto", "Helvetica", "Arial", sans-serif; 
-              min-height: ${isMobile ? '200px' : '300px'}; 
-              outline: none;
-              overflow-wrap: break-word;
-              word-wrap: break-word;
-            `,
-            class: 'tiptap-editor-content',
-          },
-          handleDrop: (view, event, slice, moved) => {
-            if (event.dataTransfer && event.dataTransfer.files.length > 0) {
-              const files = Array.from(event.dataTransfer.files);
-              const imageFiles = files.filter(file => file.type.startsWith('image/'));
-              
-              if (imageFiles.length > 0) {
-                event.preventDefault();
-                handleMultipleFiles(imageFiles);
-                return true;
-              }
-            }
-            return false;
-          },
-          handlePaste: (view, event, slice) => {
-            handlePaste(event);
-            return false;
-          },
-        },
-      });
-    }
-  }, [editor, isMobile, handleMultipleFiles, handlePaste]);
-
-  // Sync offline images when coming back online
-  useEffect(() => {
-    const handleOnline = () => {
-      if (note?.id) {
-        console.log('Coming back online, syncing images...');
-        syncOfflineImages();
-      }
-    };
-
-    window.addEventListener('online', handleOnline);
-    return () => window.removeEventListener('online', handleOnline);
-  }, [note?.id, syncOfflineImages]);
-
-  // Cleanup on unmount
+  // Enhanced cleanup on unmount
   useEffect(() => {
     return () => {
       if (currentNoteId.current) {
         releaseLock(currentNoteId.current);
+        registerPresence('leave');
       }
       if (lockExtensionIntervalRef.current) {
         clearInterval(lockExtensionIntervalRef.current);
       }
+      if (presenceIntervalRef.current) {
+        clearInterval(presenceIntervalRef.current);
+      }
+      stopActiveCollaborationPolling();
+      stopSharedNotePolling();
     };
-  }, [releaseLock]);
+  }, [releaseLock, registerPresence, stopActiveCollaborationPolling, stopSharedNotePolling]);
 
+  // ===== RENDER =====
   if (!note) {
     return (
       <Box
@@ -941,7 +1373,7 @@ const NoteEditor = ({ note, onUpdateNote, onBack, isMobile = false }) => {
   }
 
   const canEdit = note.permission === 'edit' && !lockOwner;
-  const isShared = note.shared || false;
+  const isShared = note.shared || note.hasBeenShared || false;
 
   return (
     <Box sx={{ 
@@ -990,6 +1422,7 @@ const NoteEditor = ({ note, onUpdateNote, onBack, isMobile = false }) => {
             
             {/* Mobile status indicators */}
             <Box display="flex" gap={0.5} alignItems="center">
+              {syncingChanges && <SyncIcon color="primary" fontSize="small" className="rotating" />}
               {saving && <SaveIcon color="primary" fontSize="small" />}
               {hasUnsavedChanges && !saving && (
                 <Chip label="•" size="small" color="warning" sx={{ minWidth: 8, height: 8, '& .MuiChip-label': { px: 0 } }} />
@@ -1043,6 +1476,51 @@ const NoteEditor = ({ note, onUpdateNote, onBack, isMobile = false }) => {
             </Alert>
           )}
 
+          {/* Enhanced Collaboration Alert */}
+          {activeEditors.length > 0 && showCollaborationAlert && (
+            <Collapse in={showCollaborationAlert}>
+              <Alert 
+                severity="info" 
+                sx={{ mb: 2 }}
+                action={
+                  <IconButton
+                    aria-label="close"
+                    color="inherit"
+                    size="small"
+                    onClick={() => setShowCollaborationAlert(false)}
+                  >
+                    <ExpandLessIcon />
+                  </IconButton>
+                }
+                icon={
+                  <AvatarGroup max={3} sx={{ '& .MuiAvatar-root': { width: 24, height: 24 } }}>
+                    {activeEditors.slice(0, 3).map(editor => (
+                      <Avatar key={editor.id} src={editor.avatar} sx={{ width: 24, height: 24 }}>
+                        {editor.name?.charAt(0)}
+                      </Avatar>
+                    ))}
+                  </AvatarGroup>
+                }
+              >
+                {activeEditors.length === 1 
+                  ? `${activeEditors[0].name} is also editing this note`
+                  : `${activeEditors.length} others are editing this note`
+                }
+                {collaborationActiveRef.current && (
+                  <Typography variant="caption" display="block" sx={{ mt: 0.5, opacity: 0.8 }}>
+                    Real-time sync active
+                  </Typography>
+                )}
+              </Alert>
+            </Collapse>
+          )}
+          
+          {hasRemoteChanges && (
+            <Alert severity="success" sx={{ mb: 2 }}>
+              Note updated with recent changes from collaborators
+            </Alert>
+          )}
+
           {/* Desktop Header */}
           {!isMobile && (
             <Box sx={{ mb: 2, display: 'flex', alignItems: 'center', gap: 2 }}>
@@ -1064,6 +1542,14 @@ const NoteEditor = ({ note, onUpdateNote, onBack, isMobile = false }) => {
               
               {/* Status chips */}
               <Box display="flex" gap={1} alignItems="center" flexShrink={0}>
+                {syncingChanges && (
+                  <Chip 
+                    label="Syncing..." 
+                    size="small" 
+                    color="info" 
+                    icon={<SyncIcon className="rotating" />}
+                  />
+                )}
                 {saving && <Chip label="Saving..." size="small" color="primary" />}
                 {hasUnsavedChanges && !saving && (
                   <Chip label="Unsaved changes" size="small" color="warning" variant="outlined" />
@@ -1091,13 +1577,32 @@ const NoteEditor = ({ note, onUpdateNote, onBack, isMobile = false }) => {
                 
                 {/* Shared indicator */}
                 {isShared && (
-                  <Tooltip title={note.sharedBy ? `Shared by ${note.sharedBy}` : 'Shared note'}>
+                  <Tooltip title={
+                    note.sharedBy 
+                      ? `Shared by ${note.sharedBy}` 
+                      : note.hasBeenShared 
+                        ? `Shared with ${note.sharedWith?.length || 0} ${note.sharedWith?.length === 1 ? 'person' : 'people'}`
+                        : 'Shared note'
+                  }>
                     <Chip
                       icon={<PeopleIcon />}
                       label="Shared"
                       size="small"
                       color="secondary"
                     />
+                  </Tooltip>
+                )}
+                
+                {/* Active editors */}
+                {activeEditors.length > 0 && (
+                  <Tooltip title={`${activeEditors.length} ${activeEditors.length === 1 ? 'person' : 'people'} editing`}>
+                    <AvatarGroup max={3} sx={{ '& .MuiAvatar-root': { width: 28, height: 28 } }}>
+                      {activeEditors.map(editor => (
+                        <Avatar key={editor.id} src={editor.avatar} sx={{ width: 28, height: 28 }}>
+                          {editor.name?.charAt(0)}
+                        </Avatar>
+                      ))}
+                    </AvatarGroup>
                   </Tooltip>
                 )}
                 
@@ -1479,6 +1984,47 @@ const NoteEditor = ({ note, onUpdateNote, onBack, isMobile = false }) => {
         </DialogActions>
       </Dialog>
 
+      {/* Conflict Resolution Dialog */}
+      <Dialog open={conflictDialogOpen} maxWidth="md" fullWidth>
+        <DialogTitle>Conflicting Changes Detected</DialogTitle>
+        <DialogContent>
+          <Typography variant="body1" sx={{ mb: 2 }}>
+            Another user ({pendingRemoteUpdate?.lastEditor?.name}) made changes while you were editing. 
+            How would you like to resolve this?
+          </Typography>
+          
+          <Box sx={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 2, mt: 2 }}>
+            <Paper sx={{ p: 2 }}>
+              <Typography variant="h6" color="primary">Your Changes</Typography>
+              <Typography variant="body2" sx={{ mt: 1, maxHeight: 200, overflow: 'auto' }}>
+                Title: {title}<br/>
+                Content preview: {getCurrentContent()?.substring(0, 200)}...
+              </Typography>
+            </Paper>
+            
+            <Paper sx={{ p: 2 }}>
+              <Typography variant="h6" color="secondary">Their Changes</Typography>
+              <Typography variant="body2" sx={{ mt: 1, maxHeight: 200, overflow: 'auto' }}>
+                Title: {pendingRemoteUpdate?.title}<br/>
+                Content preview: {pendingRemoteUpdate?.content?.substring(0, 200)}...
+              </Typography>
+            </Paper>
+          </Box>
+        </DialogContent>
+        
+        <DialogActions>
+          <Button onClick={() => handleConflictResolution('accept')} color="secondary">
+            Use Their Version
+          </Button>
+          <Button onClick={() => handleConflictResolution('merge')} color="primary">
+            Merge Both
+          </Button>
+          <Button onClick={() => handleConflictResolution('reject')} variant="contained">
+            Keep My Version
+          </Button>
+        </DialogActions>
+      </Dialog>
+
       <ShareNoteDialog
         open={shareDialogOpen}
         onClose={() => setShareDialogOpen(false)}
@@ -1487,6 +2033,21 @@ const NoteEditor = ({ note, onUpdateNote, onBack, isMobile = false }) => {
           window.location.reload();
         }}
       />
+
+      <style jsx>{`
+        @keyframes rotate {
+          from {
+            transform: rotate(0deg);
+          }
+          to {
+            transform: rotate(360deg);
+          }
+        }
+        
+        .rotating {
+          animation: rotate 2s linear infinite;
+        }
+      `}</style>
     </Box>
   );
 };

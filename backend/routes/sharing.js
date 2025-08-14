@@ -130,6 +130,30 @@ router.post('/share', async (req, res) => {
     };
     await fs.writeJson(targetMetadataFile, targetMetadata);
 
+    // NEW: Update owner's metadata to track sharing
+    metadata[noteId] = {
+      ...metadata[noteId],
+      hasBeenShared: true,
+      sharedWith: metadata[noteId].sharedWith || []
+    };
+
+    // Add the new participant if not already in the list
+    const existingShare = metadata[noteId].sharedWith.find(s => s.userId === targetUser.id);
+    if (!existingShare) {
+      metadata[noteId].sharedWith.push({
+        userId: targetUser.id,
+        email: targetUserEmail,
+        permission,
+        sharedAt: new Date().toISOString()
+      });
+    } else {
+      // Update existing share (in case permission changed)
+      existingShare.permission = permission;
+      existingShare.sharedAt = new Date().toISOString();
+    }
+
+    await fs.writeJson(metadataFile, metadata);
+
     // Save shares
     await fs.writeJson(sharesFile, shares);
 
@@ -239,9 +263,27 @@ router.delete('/unshare/:noteId/:targetUserId', async (req, res) => {
     delete targetMetadata[noteId];
     await fs.writeJson(targetMetadataFile, targetMetadata);
 
+    // NEW: Update owner's metadata to remove sharing info
+    const ownerNotesDir = path.join(__dirname, '../data/notes', ownerId);
+    const ownerMetadataFile = path.join(ownerNotesDir, 'metadata.json');
+    const ownerMetadata = await fs.readJson(ownerMetadataFile).catch(() => ({}));
+
+    if (ownerMetadata[noteId]) {
+      // Remove the user from sharedWith list
+      ownerMetadata[noteId].sharedWith = (ownerMetadata[noteId].sharedWith || [])
+        .filter(s => s.userId !== targetUserId);
+      
+      // If no one is shared with anymore, remove hasBeenShared flag
+      if (ownerMetadata[noteId].sharedWith.length === 0) {
+        ownerMetadata[noteId].hasBeenShared = false;
+        delete ownerMetadata[noteId].sharedWith;
+      }
+      
+      await fs.writeJson(ownerMetadataFile, ownerMetadata);
+    }
+
     // If no more participants, move note back to owner's directory
     if (Object.keys(shareInfo.participants).length === 0) {
-      const ownerNotesDir = path.join(__dirname, '../data/notes', ownerId);
       const ownerNoteFile = path.join(ownerNotesDir, `${noteId}.md`);
       const sharedNoteFile = path.join(__dirname, '../data/shared_notes', `${shareInfo.sharedNoteId}.md`);
 

@@ -1,15 +1,29 @@
 version: '3.8'
 
 services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --save 20 1 --loglevel warning
+    networks:
+      - app-network
+
   backend:
     build: ./backend
     environment:
       - NODE_ENV=production
       - PORT=3001
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
     env_file:
       - .env
     volumes:
       - ./data:/app/data
+    depends_on:
+      - redis
     networks:
       - app-network
 
@@ -36,3 +50,4 @@ networks:
 
 volumes:
   data:
+  redis_data:
