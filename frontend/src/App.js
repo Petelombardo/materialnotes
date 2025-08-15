@@ -29,7 +29,9 @@ import {
   Sync as SyncIcon,
   Warning as WarningIcon,
   Wifi as WifiIcon,
-  WifiOff as WifiOffIcon
+  WifiOff as WifiOffIcon,
+  Smartphone,
+  AutoAwesome as AutoAwesomeIcon
 } from '@mui/icons-material';
 import Login from './components/Login';
 import NoteEditor from './components/NoteEditor';
@@ -56,9 +58,12 @@ function App() {
   const [mobileView, setMobileView] = useState('list'); // 'list' or 'editor'
   const [pendingSave, setPendingSave] = useState(null);
   
-  // NEW: Auto-refresh state
+  // Enhanced sync and mobile state
   const [notesTimestamps, setNotesTimestamps] = useState(new Map());
   const [refreshIntervalId, setRefreshIntervalId] = useState(null);
+  const [bulkSyncInProgress, setBulkSyncInProgress] = useState(false);
+  const [lastBulkSync, setLastBulkSync] = useState(null);
+  const [appLifecycleStatus, setAppLifecycleStatus] = useState('active');
   
   // Responsive breakpoints
   const theme = useTheme();
@@ -103,7 +108,7 @@ function App() {
     }
   };
 
-  // NEW: Check for note updates based on timestamps
+  // Enhanced note update handling for bulk sync
   const checkForNoteUpdates = async (silent = true) => {
     if (!user || !isOnline) {
       if (!silent) console.log('🔍 Skipping note updates check - user:', !!user, 'online:', isOnline);
@@ -189,6 +194,47 @@ function App() {
     }
   };
 
+  // NEW: Handle notes updated from bulk sync in NoteEditor
+  const handleNotesUpdated = (updatedNotes) => {
+    console.log('📥 Handling bulk sync note updates from NoteEditor:', updatedNotes.length);
+    
+    // Update the notes state with the new data
+    setNotes(prevNotes => {
+      const updatedNotesMap = new Map(updatedNotes.map(note => [note.id, note]));
+      
+      return prevNotes.map(note => {
+        const updated = updatedNotesMap.get(note.id);
+        if (updated) {
+          console.log(`🔄 Updating note ${note.id} in App state`);
+          return updated;
+        }
+        return note;
+      });
+    });
+    
+    // Update timestamps
+    setNotesTimestamps(prev => {
+      const updated = new Map(prev);
+      updatedNotes.forEach(note => {
+        if (note.updatedAt) {
+          updated.set(note.id, new Date(note.updatedAt).getTime());
+        }
+      });
+      return updated;
+    });
+    
+    // Update selected note if it was affected
+    if (selectedNote) {
+      const updatedSelectedNote = updatedNotes.find(note => note.id === selectedNote.id);
+      if (updatedSelectedNote) {
+        console.log('🔄 Updating selected note from bulk sync');
+        setSelectedNote(updatedSelectedNote);
+      }
+    }
+    
+    setLastBulkSync(new Date());
+  };
+
   // Modified loadNotes to also set up timestamps
   const loadNotes = async () => {
     try {
@@ -239,26 +285,25 @@ function App() {
     }
   };
 
-  // NEW: Start automatic refresh for shared notes
+  // Enhanced auto-refresh management
   const startAutoRefresh = () => {
     if (refreshIntervalId) {
       console.log('🛑 Stopping existing auto-refresh before starting new one');
       clearInterval(refreshIntervalId);
     }
     
-    console.log('🚀 Starting auto-refresh for notes (every 10 seconds)');
+    console.log('🚀 Starting auto-refresh for notes (every 30 seconds)');
     
-    // Check for updates every 10 seconds
+    // Increased interval to be less aggressive
     const intervalId = setInterval(() => {
       console.log('⏰ Auto-refresh interval triggered');
       checkForNoteUpdates(true);
-    }, 10000);
+    }, 30000); // Changed from 10s to 30s to be less aggressive
     
     setRefreshIntervalId(intervalId);
     console.log('✅ Auto-refresh started with interval ID:', intervalId);
   };
 
-  // NEW: Stop automatic refresh
   const stopAutoRefresh = () => {
     if (refreshIntervalId) {
       console.log('🛑 Stopping auto-refresh, interval ID:', refreshIntervalId);
@@ -311,6 +356,14 @@ function App() {
           return prevSelected;
         });
         
+        // Update timestamps
+        setNotesTimestamps(prev => {
+          const updated = new Map(prev);
+          updated.delete(tempNote.id); // Remove temp note timestamp
+          updated.set(serverNote.id, new Date(serverNote.updatedAt).getTime()); // Add server note timestamp
+          return updated;
+        });
+        
         removeTemporaryNoteFromStorage(tempNote.id);
         console.log(`Successfully synced temporary note ${tempNote.id} -> ${serverNote.id}`);
         
@@ -335,7 +388,7 @@ function App() {
           console.log('Triggering sync after coming online...');
           await syncTemporaryNotes();
           await loadNotes();
-          startAutoRefresh(); // NEW: Start auto-refresh when coming online
+          startAutoRefresh();
         } catch (error) {
           console.error('Failed to sync temporary notes:', error);
         }
@@ -345,7 +398,7 @@ function App() {
     const handleBrowserOffline = () => {
       console.log('Browser detected: offline');
       setIsOnline(false);
-      stopAutoRefresh(); // NEW: Stop auto-refresh when going offline
+      stopAutoRefresh();
     };
 
     window.addEventListener('online', handleBrowserOnline);
@@ -364,7 +417,7 @@ function App() {
           console.log('API online - triggering sync...');
           await syncTemporaryNotes();
           await loadNotes();
-          startAutoRefresh(); // NEW: Start auto-refresh when API comes online
+          startAutoRefresh();
         } catch (error) {
           console.error('Failed to sync temporary notes:', error);
         }
@@ -374,7 +427,7 @@ function App() {
     api.addEventListener('offline', () => {
       console.log('API detected: offline');
       setIsOnline(false);
-      stopAutoRefresh(); // NEW: Stop auto-refresh when API goes offline
+      stopAutoRefresh();
     });
     
     api.addEventListener('sync-start', () => setSyncInProgress(true));
@@ -409,11 +462,11 @@ function App() {
     return () => {
       window.removeEventListener('online', handleBrowserOnline);
       window.removeEventListener('offline', handleBrowserOffline);
-      stopAutoRefresh(); // NEW: Clean up auto-refresh
+      stopAutoRefresh();
     };
   };
 
-  // Rest of the component remains largely the same...
+  // Create note function (unchanged)
   const createNote = async () => {
     try {
       if (pendingSave && selectedNote) {
@@ -628,11 +681,11 @@ function App() {
       if (cleanupOfflineListeners) {
         cleanupOfflineListeners();
       }
-      stopAutoRefresh(); // NEW: Clean up auto-refresh on unmount
+      stopAutoRefresh();
     };
   }, []);
 
-  // Event handlers (unchanged except for adding auto-refresh management)
+  // Event handlers
   const handleNoteSelect = async (note) => {
     if (pendingSave && selectedNote) {
       try {
@@ -733,7 +786,6 @@ function App() {
         setUser(userData);
         await loadNotes();
         
-        // NEW: Start auto-refresh after successful authentication and loading notes
         if (isOnline) {
           startAutoRefresh();
         }
@@ -787,7 +839,7 @@ function App() {
   };
 
   const handleAuthFailure = async () => {
-    stopAutoRefresh(); // NEW: Stop auto-refresh on auth failure
+    stopAutoRefresh();
     localStorage.removeItem('token');
     delete api.api.defaults.headers.common['Authorization'];
     await api.clearAuthData();
@@ -805,7 +857,7 @@ function App() {
       console.error('Logout request failed:', error);
     }
     
-    stopAutoRefresh(); // NEW: Stop auto-refresh on logout
+    stopAutoRefresh();
     localStorage.removeItem('token');
     delete api.api.defaults.headers.common['Authorization'];
     await api.clearAuthData();
@@ -814,7 +866,7 @@ function App() {
     setSelectedNote(null);
     setAnchorEl(null);
     setMobileView('list');
-    setNotesTimestamps(new Map()); // NEW: Clear timestamps
+    setNotesTimestamps(new Map());
   };
 
   const handleSyncNow = async () => {
@@ -858,7 +910,7 @@ function App() {
     return isOnline ? 'Online' : 'Offline';
   };
 
-  // Rest of the render logic remains the same...
+  // Render logic
   if (loading) {
     return (
       <Box display="flex" justifyContent="center" alignItems="center" minHeight="100vh">
@@ -935,6 +987,22 @@ function App() {
                   }}
                 >
                   PWA
+                </Typography>
+              )}
+              {isMobile && (
+                <Typography 
+                  component="span" 
+                  variant="caption" 
+                  sx={{ 
+                    ml: 1, 
+                    px: 1, 
+                    py: 0.5, 
+                    backgroundColor: 'rgba(255,255,255,0.15)', 
+                    borderRadius: 1,
+                    fontSize: '0.65rem'
+                  }}
+                >
+                  📱 Enhanced Sync
                 </Typography>
               )}
             </Typography>
@@ -1070,6 +1138,8 @@ function App() {
                 onBack={handleBackToList}
                 isMobile={isMobile}
                 currentUser={user}
+                notes={notes}                    // NEW: Array of all notes for bulk sync
+                onNotesUpdated={handleNotesUpdated}  // NEW: Callback when bulk sync updates notes
               />
             </Box>
           )}

@@ -5,12 +5,63 @@ const path = require('path');
 const { v4: uuidv4 } = require('uuid');
 const multer = require('multer');
 const sharp = require('sharp');
+const crypto = require('crypto');
+const rateLimit = require('express-rate-limit');
 const fileLockManager = require('../utils/fileLock');
 const collaborationManager = require('../utils/collaborationManager');
 const router = express.Router();
 
-// REMOVED: In-memory store - now using Redis-backed collaborationManager
-// const activeEditors = new Map(); // ❌ REMOVED
+// ===== MIDDLEWARE SETUP =====
+async function safeCollaborationOperation(operation, fallbackValue = null) {
+  try {
+    if (!collaborationManager) {
+      console.warn('⚠️ collaborationManager not available, using fallback');
+      return fallbackValue;
+    }
+    return await operation();
+  } catch (error) {
+    console.error('❌ Collaboration operation failed:', error.message);
+    return fallbackValue;
+  }
+}
+
+
+// Mobile detection middleware
+const mobileDetectionMiddleware = (req, res, next) => {
+  const userAgent = req.get('User-Agent') || '';
+  const isMobile = /Mobile|Android|iPhone|iPad|webOS|BlackBerry|Windows Phone/i.test(userAgent);
+  req.isMobile = isMobile;
+  console.log(`📱 Device detection: ${isMobile ? 'Mobile' : 'Desktop'} - ${userAgent.substring(0, 50)}...`);
+  next();
+};
+
+// Enhanced rate limiting with mobile-specific considerations
+const collaborationLimiter = rateLimit({
+  windowMs: 1 * 60 * 1000, // 1 minute
+  max: (req) => {
+    // More generous limits for mobile devices and bulk operations
+    if (req.path.includes('/bulk-sync')) return req.isMobile ? 10 : 5;
+    return req.isMobile ? 60 : 30;
+  },
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => {
+    const device = req.isMobile ? 'mobile' : 'desktop';
+    return `${req.user?.id || req.ip}:${req.params.noteId || 'bulk'}:${device}`;
+  },
+  message: {
+    error: 'Too many collaboration requests, please slow down.',
+    retryAfter: 60,
+    hint: req => req.isMobile ? 'Mobile apps may sync aggressively after resuming' : 'Try reducing polling frequency'
+  },
+  skip: (req) => {
+    // Skip rate limiting for simple GET requests that don't involve real-time collaboration
+    return req.method === 'GET' && 
+           !req.path.includes('/updates') && 
+           !req.path.includes('/presence') && 
+           !req.path.includes('/heartbeat');
+  }
+});
 
 // Configure multer for image uploads
 const upload = multer({
@@ -31,23 +82,10 @@ const upload = multer({
 // Middleware to authenticate all note routes
 router.use(passport.authenticate('jwt', { session: false }));
 
-// Enhanced rate limiting for collaboration endpoints
-const rateLimit = require('express-rate-limit');
-const collaborationLimiter = rateLimit({
-  windowMs: 1 * 60 * 1000, // 1 minute
-  max: 30, // Reduced from unlimited to 30 requests per minute
-  standardHeaders: true,
-  legacyHeaders: false,
-  keyGenerator: (req) => `${req.user?.id || req.ip}:${req.params.noteId || 'unknown'}`,
-  message: {
-    error: 'Too many collaboration requests, please slow down.',
-    retryAfter: 60
-  },
-  skip: (req) => {
-    // Skip rate limiting for simple GET requests
-    return req.method === 'GET' && !req.path.includes('/updates') && !req.path.includes('/presence');
-  }
-});
+// Apply mobile detection to all routes
+router.use(mobileDetectionMiddleware);
+
+// ===== HELPER FUNCTIONS =====
 
 // Helper function to resolve actual file path (handles symlinks)
 async function resolveNotePath(noteFilePath) {
@@ -62,7 +100,7 @@ async function resolveNotePath(noteFilePath) {
   }
 }
 
-// Helper function to find the original note file and metadata for shared notes
+// Enhanced helper function to find the original note file and metadata for shared notes
 async function findOriginalNoteInfo(userId, noteId) {
   try {
     const userNotesDir = path.join(__dirname, '../data/notes', userId);
@@ -222,7 +260,7 @@ async function processAndSaveImage(imageBuffer, userId, noteId, originalName) {
   };
 }
 
-// Function to sync shared note updates
+// Enhanced function to sync shared note updates
 async function syncSharedNoteUpdates(originalNoteInfo, updatedMetadata) {
   if (!originalNoteInfo.metadata.hasBeenShared && !updatedMetadata.shared) return;
 
@@ -288,20 +326,217 @@ async function syncSharedNoteUpdates(originalNoteInfo, updatedMetadata) {
   }
 }
 
-// ===== ENHANCED COLLABORATION ENDPOINTS WITH REDIS =====
+// ===== NEW ENHANCED COLLABORATION ENDPOINTS =====
 
-// Enhanced: Get note updates since a specific timestamp (with better rate limiting)
+router.post('/bulk-sync', collaborationLimiter, async (req, res) => {
+  try {
+    const { noteTimestamps } = req.body; // { noteId: timestamp, ... }
+    const userId = req.user.id;
+    
+    if (!noteTimestamps || typeof noteTimestamps !== 'object') {
+      return res.status(400).json({ error: 'Invalid noteTimestamps format' });
+    }
+    
+    console.log(`🔄 Bulk sync requested for ${Object.keys(noteTimestamps).length} notes from ${req.isMobile ? 'mobile' : 'desktop'} device`);
+    
+    const results = {
+      updates: {},
+      errors: {},
+      statistics: {
+        checked: 0,
+        updated: 0,
+        errors: 0,
+        skipped: 0
+      }
+    };
+    
+    // Process notes in batches to avoid overwhelming the system
+    const noteIds = Object.keys(noteTimestamps);
+    const batchSize = req.isMobile ? 8 : 10; // Smaller batches for mobile
+    
+    for (let i = 0; i < noteIds.length; i += batchSize) {
+      const batch = noteIds.slice(i, i + batchSize);
+      
+      const batchPromises = batch.map(async (noteId) => {
+        try {
+          results.statistics.checked++;
+          
+          const since = noteTimestamps[noteId];
+          if (!since) {
+            results.statistics.skipped++;
+            return;
+          }
+          
+          // Check if user has access to this note
+          if (!await checkNoteAccess(userId, noteId)) {
+            results.errors[noteId] = 'Access denied';
+            results.statistics.errors++;
+            return;
+          }
+          
+          // Find the original note info (handles shared notes)
+          const originalNoteInfo = await findOriginalNoteInfo(userId, noteId);
+          if (!originalNoteInfo) {
+            results.errors[noteId] = 'Note not found';
+            results.statistics.errors++;
+            return;
+          }
+          
+          if (!await fs.pathExists(originalNoteInfo.noteFile)) {
+            results.errors[noteId] = 'Note file not found';
+            results.statistics.errors++;
+            return;
+          }
+          
+          // Check if note was modified after the since timestamp
+          const sinceDate = new Date(since);
+          const updatedAt = new Date(originalNoteInfo.metadata.updatedAt);
+          
+          if (updatedAt > sinceDate) {
+            // Note has updates
+            const realPath = await resolveNotePath(originalNoteInfo.noteFile);
+            const content = await fs.readFile(realPath, 'utf8');
+            
+            const lastEditor = originalNoteInfo.metadata.lastEditedBy ? {
+              id: originalNoteInfo.metadata.lastEditedBy,
+              name: originalNoteInfo.metadata.lastEditorName,
+              avatar: originalNoteInfo.metadata.lastEditorAvatar
+            } : null;
+            
+            results.updates[noteId] = {
+              content,
+              title: originalNoteInfo.metadata.title,
+              updatedAt: originalNoteInfo.metadata.updatedAt,
+              lastEditor,
+              noteId
+            };
+            
+            results.statistics.updated++;
+            
+            console.log(`📝 Note ${noteId} has updates`);
+          }
+          
+        } catch (error) {
+          console.error(`❌ Error checking note ${noteId}:`, error);
+          results.errors[noteId] = error.message;
+          results.statistics.errors++;
+        }
+      });
+      
+      await Promise.all(batchPromises);
+      
+      // Longer delay between batches for mobile to avoid overwhelming connections
+      if (i + batchSize < noteIds.length) {
+        await new Promise(resolve => setTimeout(resolve, req.isMobile ? 100 : 50));
+      }
+    }
+    
+    console.log('✅ Bulk sync complete:', results.statistics);
+    
+    res.json(results);
+    
+  } catch (error) {
+    console.error('❌ Bulk sync failed:', error);
+    res.status(500).json({ error: 'Bulk sync failed' });
+  }
+});
+
+// Get note metadata only (for quick staleness checks)
+router.get('/metadata', async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const userNotesDir = path.join(__dirname, '../data/notes', userId);
+    await fs.ensureDir(userNotesDir);
+    
+    const metadataFile = path.join(userNotesDir, 'metadata.json');
+    const metadata = await fs.readJson(metadataFile).catch(() => ({}));
+    
+    const noteMetadata = {};
+    
+    for (const [id, meta] of Object.entries(metadata)) {
+      const noteFile = path.join(userNotesDir, `${id}.md`);
+      if (await fs.pathExists(noteFile)) {
+        noteMetadata[id] = {
+          id,
+          title: meta.title,
+          updatedAt: meta.updatedAt,
+          createdAt: meta.createdAt,
+          shared: meta.shared || false,
+          sharedBy: meta.sharedBy || null,
+          hasBeenShared: meta.hasBeenShared || false,
+          permission: meta.permission || 'edit',
+          lastEditedBy: meta.lastEditedBy,
+          lastEditorName: meta.lastEditorName,
+          lastEditorAvatar: meta.lastEditorAvatar
+        };
+      }
+    }
+    
+    console.log(`📊 Returning metadata for ${Object.keys(noteMetadata).length} notes`);
+    res.json(noteMetadata);
+  } catch (error) {
+    console.error('Error fetching note metadata:', error);
+    res.status(500).json({ error: 'Failed to fetch note metadata' });
+  }
+});
+
+// Enhanced presence heartbeat endpoint with mobile optimizations
+router.post('/:noteId/heartbeat', collaborationLimiter, async (req, res) => {
+  try {
+    const { noteId } = req.params;
+    const userId = req.user.id;
+    
+    // Check if user has access to this note
+    if (!await checkNoteAccess(userId, noteId)) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+    
+    // Find the original note info
+    const originalNoteInfo = await findOriginalNoteInfo(userId, noteId);
+    if (!originalNoteInfo) {
+      return res.status(404).json({ error: 'Note not found' });
+    }
+    
+    // Update presence timestamp and set mobile status
+    const presenceNoteId = originalNoteInfo.noteId;
+    await collaborationManager.updateEditorLastSeen(presenceNoteId, userId);
+    
+    // Set mobile presence if this is a mobile device
+    if (req.isMobile) {
+      await collaborationManager.setMobilePresence(presenceNoteId, userId, true);
+    }
+    
+    // Return current note timestamp and sync recommendations
+    const syncRecommendations = await collaborationManager.getSyncRecommendations(presenceNoteId);
+    
+    res.json({ 
+      success: true,
+      noteUpdatedAt: originalNoteInfo.metadata.updatedAt,
+      serverTime: new Date().toISOString(),
+      syncRecommendations,
+      isMobile: req.isMobile
+    });
+    
+  } catch (error) {
+    console.error('Error updating heartbeat:', error);
+    res.status(500).json({ error: 'Failed to update heartbeat' });
+  }
+});
+
+// Enhanced updates endpoint with conflict detection
 router.get('/:noteId/updates', collaborationLimiter, async (req, res) => {
   try {
     const { noteId } = req.params;
-    const { since } = req.query;
+    const { since, localContentHash } = req.query;
     const userId = req.user.id;
     
     console.log('🔍 Updates endpoint called:', {
       noteId,
       userId,
       since,
-      sinceType: typeof since
+      sinceType: typeof since,
+      hasLocalHash: !!localContentHash,
+      isMobile: req.isMobile
     });
     
     // Check if user has access to this note
@@ -354,6 +589,19 @@ router.get('/:noteId/updates', collaborationLimiter, async (req, res) => {
       const realPath = await resolveNotePath(originalNoteInfo.noteFile);
       const content = await fs.readFile(realPath, 'utf8');
       
+      // Enhanced conflict detection using content hash
+      let hasConflict = false;
+      if (localContentHash && content) {
+        const serverContentHash = crypto.createHash('md5').update(content).digest('hex');
+        hasConflict = serverContentHash !== localContentHash;
+        
+        console.log('🔍 Conflict detection:', {
+          localHash: localContentHash.substring(0, 8) + '...',
+          serverHash: serverContentHash.substring(0, 8) + '...',
+          hasConflict
+        });
+      }
+      
       // Get the last editor info
       const lastEditor = originalNoteInfo.metadata.lastEditedBy ? {
         id: originalNoteInfo.metadata.lastEditedBy,
@@ -366,14 +614,21 @@ router.get('/:noteId/updates', collaborationLimiter, async (req, res) => {
         contentLength: content ? content.length : 0,
         title: originalNoteInfo.metadata.title,
         updatedAt: originalNoteInfo.metadata.updatedAt,
-        lastEditor: lastEditor ? lastEditor.name : 'Unknown'
+        lastEditor: lastEditor ? lastEditor.name : 'Unknown',
+        hasConflict
       });
       
       return res.json({
         content,
         title: originalNoteInfo.metadata.title,
         updatedAt: originalNoteInfo.metadata.updatedAt,
-        lastEditor
+        lastEditor,
+        hasConflict,
+        conflictInfo: hasConflict ? {
+          message: 'Local and remote changes detected',
+          lastEditor: lastEditor?.name || 'Unknown user',
+          recommendation: 'merge'
+        } : null
       });
     }
     
@@ -382,6 +637,7 @@ router.get('/:noteId/updates', collaborationLimiter, async (req, res) => {
     // No updates
     res.json({ 
       updatedAt: originalNoteInfo.metadata.updatedAt,
+      hasConflict: false,
       debug: {
         since,
         noteUpdatedAt: originalNoteInfo.metadata.updatedAt,
@@ -396,56 +652,14 @@ router.get('/:noteId/updates', collaborationLimiter, async (req, res) => {
   }
 });
 
-// Enhanced: Register/unregister as active editor (Redis-backed)
+// Enhanced: Register/unregister as active editor (Redis-backed with mobile support)
 router.post('/:noteId/presence', collaborationLimiter, async (req, res) => {
   try {
     const { noteId } = req.params;
     const { action, editorInfo } = req.body;
     const userId = req.user.id;
     
-    // Check if user has access to this note
-    if (!await checkNoteAccess(userId, noteId)) {
-      return res.status(403).json({ error: 'Access denied' });
-    }
-    
-    // Find the original note info to use consistent noteId for presence tracking
-    const originalNoteInfo = await findOriginalNoteInfo(userId, noteId);
-    if (!originalNoteInfo) {
-      return res.status(404).json({ error: 'Note not found' });
-    }
-    
-    // Use the original note ID for presence tracking so all users see the same presence
-    const presenceNoteId = originalNoteInfo.noteId;
-    
-    if (action === 'join') {
-      // Add editor using Redis-backed collaboration manager
-      await collaborationManager.addActiveEditor(presenceNoteId, userId, {
-        ...editorInfo,
-        name: editorInfo.name || req.user.name,
-        avatar: editorInfo.avatar || req.user.avatar
-      });
-      
-      console.log(`User ${userId} joined editing note ${presenceNoteId} (original: ${originalNoteInfo.isShared})`);
-      
-    } else if (action === 'leave') {
-      // Remove editor using Redis-backed collaboration manager
-      await collaborationManager.removeActiveEditor(presenceNoteId, userId);
-      console.log(`User ${userId} left editing note ${presenceNoteId}`);
-    }
-    
-    res.json({ success: true });
-    
-  } catch (error) {
-    console.error('Error managing presence:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// Enhanced: Get list of active editors for a note (Redis-backed)
-router.get('/:noteId/presence', collaborationLimiter, async (req, res) => {
-  try {
-    const { noteId } = req.params;
-    const userId = req.user.id;
+    console.log('👋 Presence POST request:', { noteId, action, userId });
     
     // Check if user has access to this note
     if (!await checkNoteAccess(userId, noteId)) {
@@ -461,18 +675,74 @@ router.get('/:noteId/presence', collaborationLimiter, async (req, res) => {
     // Use the original note ID for presence tracking
     const presenceNoteId = originalNoteInfo.noteId;
     
-    // Get active editors using Redis-backed collaboration manager
-    const activeEditorsList = await collaborationManager.getActiveEditors(presenceNoteId);
+    // Safely handle collaboration operations
+    if (action === 'join') {
+      const success = await safeCollaborationOperation(async () => {
+        return await collaborationManager.addActiveEditor(presenceNoteId, userId, {
+          ...editorInfo,
+          name: editorInfo.name || req.user.name,
+          avatar: editorInfo.avatar || req.user.avatar
+        });
+      }, true); // fallback to success
+      
+      console.log(`✅ User ${userId} ${success ? 'joined' : 'attempted to join'} editing note ${presenceNoteId}`);
+      
+    } else if (action === 'leave') {
+      const success = await safeCollaborationOperation(async () => {
+        return await collaborationManager.removeActiveEditor(presenceNoteId, userId);
+      }, true); // fallback to success
+      
+      console.log(`✅ User ${userId} ${success ? 'left' : 'attempted to leave'} editing note ${presenceNoteId}`);
+    }
+    
+    res.json({ success: true });
+    
+  } catch (error) {
+    console.error('❌ Error managing presence:', error);
+    // Return success anyway to prevent blocking the main app functionality
+    res.json({ success: true, warning: 'Presence tracking unavailable' });
+  }
+});
+
+// Enhanced: Get list of active editors for a note (Redis-backed with mobile info)
+router.get('/:noteId/presence', collaborationLimiter, async (req, res) => {
+  try {
+    const { noteId } = req.params;
+    const userId = req.user.id;
+    
+    console.log('👥 Presence GET request:', { noteId, userId });
+    
+    // Check if user has access to this note
+    if (!await checkNoteAccess(userId, noteId)) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+    
+    // Find the original note info to use consistent noteId for presence tracking
+    const originalNoteInfo = await findOriginalNoteInfo(userId, noteId);
+    if (!originalNoteInfo) {
+      return res.status(404).json({ error: 'Note not found' });
+    }
+    
+    // Use the original note ID for presence tracking
+    const presenceNoteId = originalNoteInfo.noteId;
+    
+    // Safely get active editors with fallback
+    const activeEditorsList = await safeCollaborationOperation(async () => {
+      return await collaborationManager.getActiveEditors(presenceNoteId);
+    }, []); // fallback to empty array
+    
+    console.log(`👥 Active editors for note ${presenceNoteId}:`, activeEditorsList.length);
     
     res.json({ activeEditors: activeEditorsList });
     
   } catch (error) {
-    console.error('Error getting active editors:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    console.error('❌ Error getting active editors:', error);
+    // Return empty list to prevent blocking the app
+    res.json({ activeEditors: [] });
   }
 });
 
-// ===== EXISTING ENDPOINTS =====
+// ===== EXISTING ENDPOINTS (Enhanced) =====
 
 // Upload image to note
 router.post('/:id/images', upload.single('image'), async (req, res) => {
@@ -658,6 +928,7 @@ router.get('/', async (req, res) => {
     
     notes.sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
     
+    console.log(`📋 Returning ${notes.length} notes for user ${req.user.id}`);
     res.json(notes);
   } catch (error) {
     console.error('Error fetching notes:', error);
@@ -792,6 +1063,8 @@ router.post('/', async (req, res) => {
     };
     await fs.writeJson(metadataFile, metadata);
     
+    console.log(`📝 Created new note ${id} for user ${req.user.id}`);
+    
     res.json({
       id,
       title,
@@ -812,14 +1085,17 @@ router.post('/', async (req, res) => {
 });
 
 // Enhanced: Update note (with shared notes sync and improved presence tracking)
+// Enhanced: Update note (with shared notes sync and improved presence tracking)
 router.put('/:id', async (req, res) => {
+  const startTime = Date.now();
+  
   try {
     const { title, content } = req.body;
     const noteId = req.params.id;
     const userId = req.user.id;
     const now = new Date().toISOString();
     
-    console.log('📝 Updating note:', {
+    console.log('🚀 PUT /api/notes/:id started:', {
       noteId,
       userId,
       hasTitle: title !== undefined,
@@ -827,13 +1103,21 @@ router.put('/:id', async (req, res) => {
       timestamp: now
     });
     
+    console.log('⏱️ Request setup completed:', Date.now() - startTime + 'ms');
+    
     const hasEditPermission = await checkEditPermission(userId, noteId);
+    console.log('⏱️ Edit permission check completed:', Date.now() - startTime + 'ms');
+    
     if (!hasEditPermission) {
+      console.log('❌ Edit permission denied for user:', userId);
       return res.status(403).json({ error: 'No edit permission for this note' });
     }
     
     const lockStatus = await fileLockManager.checkLock(noteId);
+    console.log('⏱️ Lock check completed:', Date.now() - startTime + 'ms');
+    
     if (lockStatus.locked && lockStatus.userId !== userId) {
+      console.log('❌ Note is locked by another user:', lockStatus.userId);
       return res.status(423).json({ 
         error: 'Note is locked by another user',
         lockedBy: lockStatus.userId,
@@ -843,7 +1127,10 @@ router.put('/:id', async (req, res) => {
     
     // Find the original note info (handles shared notes)
     const originalNoteInfo = await findOriginalNoteInfo(userId, noteId);
+    console.log('⏱️ Original note info found:', Date.now() - startTime + 'ms');
+    
     if (!originalNoteInfo) {
+      console.log('❌ Note not found:', noteId);
       return res.status(404).json({ error: 'Note not found' });
     }
     
@@ -855,8 +1142,11 @@ router.put('/:id', async (req, res) => {
     });
     
     if (!await fs.pathExists(originalNoteInfo.noteFile)) {
+      console.log('❌ Note file not found:', originalNoteInfo.noteFile);
       return res.status(404).json({ error: 'Note file not found' });
     }
+    
+    console.log('⏱️ File existence check completed:', Date.now() - startTime + 'ms');
     
     // Update note content in the original file
     if (content !== undefined) {
@@ -864,6 +1154,8 @@ router.put('/:id', async (req, res) => {
       await fs.writeFile(realPath, content);
       console.log('📄 Updated note content');
     }
+    
+    console.log('⏱️ File write completed:', Date.now() - startTime + 'ms');
     
     // Update metadata in the original location
     const updatedMetadata = {
@@ -889,23 +1181,36 @@ router.put('/:id', async (req, res) => {
     await fs.writeJson(originalNoteInfo.metadataFile, originalNoteInfo.allMetadata);
     
     console.log('💾 Wrote metadata to:', originalNoteInfo.metadataFile);
+    console.log('⏱️ Metadata write completed:', Date.now() - startTime + 'ms');
     
     // Enhanced: Sync updates to all shared copies
     await syncSharedNoteUpdates(originalNoteInfo, updatedMetadata);
+    console.log('⏱️ Shared notes sync completed:', Date.now() - startTime + 'ms');
     
     // Update presence timestamp for this editor using Redis-backed manager
     const presenceNoteId = originalNoteInfo.noteId;
-    await collaborationManager.updateEditorLastSeen(presenceNoteId, userId);
+    try {
+      await collaborationManager.updateEditorLastSeen(presenceNoteId, userId);
+      console.log('⏱️ Collaboration manager update completed:', Date.now() - startTime + 'ms');
+    } catch (collaborationError) {
+      console.log('⚠️ Collaboration manager update failed (continuing anyway):', collaborationError.message);
+      console.log('⏱️ Collaboration manager error handled:', Date.now() - startTime + 'ms');
+    }
     
     // Extend lock if user has it
     if (lockStatus.locked && lockStatus.userId === userId) {
       await fileLockManager.extendLock(noteId, userId);
+      console.log('⏱️ Lock extension completed:', Date.now() - startTime + 'ms');
     }
     
     // Return updated note data
     const responseContent = content !== undefined ? content : await fs.readFile(await resolveNotePath(originalNoteInfo.noteFile), 'utf8');
     
+    console.log('⏱️ Response content prepared:', Date.now() - startTime + 'ms');
     console.log('✅ Note update complete, returning response');
+    
+    const totalTime = Date.now() - startTime;
+    console.log('🏁 PUT /api/notes/:id completed in:', totalTime + 'ms');
     
     res.json({
       id: noteId,
@@ -920,11 +1225,15 @@ router.put('/:id', async (req, res) => {
       lastEditorName: updatedMetadata.lastEditorName,
       lastEditorAvatar: updatedMetadata.lastEditorAvatar
     });
+    
   } catch (error) {
-    console.error('❌ Error updating note:', error);
+    const totalTime = Date.now() - startTime;
+    console.error('❌ Error updating note after', totalTime + 'ms:', error);
+    console.error('❌ Error stack:', error.stack);
     res.status(500).json({ error: 'Failed to update note' });
   }
 });
+// STOP
 
 // Delete note
 router.delete('/:id', async (req, res) => {
@@ -965,6 +1274,7 @@ router.delete('/:id', async (req, res) => {
     
     await fileLockManager.releaseLock(noteId, userId);
     
+    console.log(`🗑️ Deleted note ${noteId} for user ${userId}`);
     res.json({ message: 'Note deleted successfully' });
   } catch (error) {
     console.error('Error deleting note:', error);
@@ -972,7 +1282,34 @@ router.delete('/:id', async (req, res) => {
   }
 });
 
-// REMOVED: Enhanced cleanup task - now handled by collaborationManager
-// setInterval() - ❌ REMOVED (Redis handles TTL and cleanup)
+// Health check endpoint for monitoring
+router.get('/health/status', (req, res) => {
+  res.json({ 
+    status: 'OK', 
+    timestamp: new Date().toISOString(),
+    redis: collaborationManager ? 'available' : 'unavailable',
+    mobile: req.isMobile || false
+  });
+});
+
+async function testCollaborationManager() {
+  try {
+    if (!collaborationManager) {
+      console.warn('⚠️ collaborationManager is not defined');
+      return false;
+    }
+    
+    // Test basic functionality
+    await collaborationManager.getActiveEditors('test');
+    console.log('✅ collaborationManager is working');
+    return true;
+  } catch (error) {
+    console.error('❌ collaborationManager test failed:', error.message);
+    return false;
+  }
+}
+
+// ADD this at the bottom of your file to test on startup:
+testCollaborationManager();
 
 module.exports = router;
