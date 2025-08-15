@@ -12,6 +12,10 @@ A modern note-taking application with WYSIWYG editing, auto-save, and multi-user
 - 🐳 **Docker Deployment** - Easy containerized setup
 - 📱 **Responsive Design** - Works on desktop and mobile
 
+## Screenshot
+<img width="1577" height="739" alt="image" src="https://github.com/user-attachments/assets/8eec4a84-c325-43bd-aee7-9ea33bf33ddf" />
+
+
 ## Project Structure
 
 ```
