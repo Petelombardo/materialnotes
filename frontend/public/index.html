@@ -39,43 +39,39 @@
     
     <style>
       /* Custom styles for ReactQuill editor */
+      /* The correct CSS classes for MDEditor font sizing */
+      body .w-md-editor-text-pre > code, 
+      body .w-md-editor-text-input { 
+        font-size: 17px !important; 
+        line-height: 1.4 !important; 
+        font-family: "Roboto", "Helvetica", "Arial", sans-serif !important;
+      }
 
-/* Replace the MDEditor styles in your index.html with this CORRECT version: */
+      /* Also target the preview area */
+      .wmde-markdown {
+        font-size: 17px !important;
+        line-height: 1.4 !important;
+        font-family: "Roboto", "Helvetica", "Arial", sans-serif !important;
+      }
 
-/* Replace the MDEditor styles in your index.html with this CORRECT version: */
+      /* Mobile adjustments */
+      @media (max-width: 600px) {
+        body .w-md-editor-text-pre > code, 
+        body .w-md-editor-text-input,
+        .wmde-markdown {
+          font-size: 17px !important;
+        }
+      }
 
-/* The correct CSS classes for MDEditor font sizing */
-body .w-md-editor-text-pre > code, 
-body .w-md-editor-text-input { 
-  font-size: 18px !important; 
-  line-height: 1.6 !important; 
-  font-family: "Roboto", "Helvetica", "Arial", sans-serif !important;
-}
-
-/* Also target the preview area */
-.wmde-markdown {
-  font-size: 18px !important;
-  line-height: 1.6 !important;
-  font-family: "Roboto", "Helvetica", "Arial", sans-serif !important;
-}
-
-/* Mobile adjustments */
-@media (max-width: 600px) {
-  body .w-md-editor-text-pre > code, 
-  body .w-md-editor-text-input,
-  .wmde-markdown {
-    font-size: 17px !important;
-  }
-}
-
-/* Larger screens */
-@media (min-width: 1200px) {
-  body .w-md-editor-text-pre > code, 
-  body .w-md-editor-text-input,
-  .wmde-markdown {
-    font-size: 19px !important;
-  }
-}
+      /* Larger screens */
+      @media (min-width: 1200px) {
+        body .w-md-editor-text-pre > code, 
+        body .w-md-editor-text-input,
+        .wmde-markdown {
+          font-size: 19px !important;
+        }
+      }
+      
       .ql-editor {
         font-size: 16px !important;
         line-height: 1.6 !important;
@@ -105,8 +101,94 @@ body .w-md-editor-text-input {
         border-left: 1px solid #ccc !important;
         border-right: 1px solid #ccc !important;
       }
+
+      /* ===== MOBILE TOOLBAR ENHANCEMENTS ===== */
       
-      /* PWA Loading Screen */
+      /* Smooth animations for toolbar expansion */
+      .MuiCollapse-root {
+        transition: height 0.3s ease-in-out !important;
+      }
+
+      /* Better touch targets on mobile */
+      @media (max-width: 768px) {
+        .MuiIconButton-root {
+          min-width: 44px !important;
+          min-height: 44px !important;
+          padding: 10px !important;
+        }
+        
+        .MuiButtonGroup-root .MuiIconButton-root {
+          min-width: 40px !important;
+          min-height: 40px !important;
+          padding: 8px !important;
+        }
+      }
+
+      /* Horizontal scroll styling for secondary toolbar on mobile */
+      .mobile-toolbar-secondary::-webkit-scrollbar {
+        height: 4px;
+      }
+
+      .mobile-toolbar-secondary::-webkit-scrollbar-track {
+        background: transparent;
+      }
+
+      .mobile-toolbar-secondary::-webkit-scrollbar-thumb {
+        background: rgba(0, 0, 0, 0.2);
+        border-radius: 2px;
+      }
+
+      /* Visual feedback for expanded state */
+      .toolbar-expand-button.expanded {
+        background-color: rgba(25, 118, 210, 0.1) !important;
+      }
+
+      /* Ensure buttons don't shrink in secondary toolbar */
+      @media (max-width: 768px) {
+        .mobile-toolbar-secondary .MuiButtonGroup-root {
+          flex-shrink: 0;
+        }
+        
+        .mobile-toolbar-secondary .MuiIconButton-root {
+          flex-shrink: 0;
+        }
+      }
+
+      /* Additional mobile toolbar improvements */
+      @media (max-width: 768px) {
+        /* Prevent toolbar overflow */
+        .MuiBox-root[data-toolbar="primary"] {
+          overflow-x: hidden;
+        }
+        
+        /* Improve touch spacing */
+        .MuiButtonGroup-root {
+          gap: 2px;
+        }
+        
+        /* Better visual separation on mobile */
+        .MuiDivider-vertical {
+          height: 24px !important;
+          margin: 0 4px !important;
+        }
+        
+        /* Smooth rotation animation for expand/collapse icons */
+        .MuiIconButton-root .MuiSvgIcon-root {
+          transition: transform 0.2s ease-in-out;
+        }
+        
+        /* Improve toolbar container spacing */
+        .toolbar-container {
+          padding: 8px !important;
+        }
+      }
+
+      /* Enhance Material-UI Collapse animation */
+      .MuiCollapse-entered {
+        overflow: visible !important;
+      }
+      
+      /* ===== PWA LOADING SCREEN ===== */
       #pwa-loading {
         position: fixed;
         top: 0;
@@ -148,6 +230,34 @@ body .w-md-editor-text-input {
       @keyframes spin {
         0% { transform: rotate(0deg); }
         100% { transform: rotate(360deg); }
+      }
+
+      /* ===== GENERAL MOBILE IMPROVEMENTS ===== */
+      @media (max-width: 768px) {
+        /* Improve tap target sizes app-wide */
+        .MuiButton-root {
+          min-height: 44px;
+        }
+        
+        .MuiChip-root {
+          min-height: 32px;
+        }
+        
+        /* Better touch feedback */
+        .MuiIconButton-root:active {
+          transform: scale(0.95);
+          transition: transform 0.1s ease-in-out;
+        }
+        
+        /* Prevent horizontal scroll issues */
+        body {
+          overflow-x: hidden;
+        }
+        
+        /* Improve Material-UI component spacing */
+        .MuiFormControl-root {
+          margin-bottom: 8px !important;
+        }
       }
     </style>
   </head>

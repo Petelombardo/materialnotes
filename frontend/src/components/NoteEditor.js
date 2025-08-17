@@ -48,7 +48,8 @@ import {
   Sync as SyncIcon,
   ExpandLess as ExpandLessIcon,
   ExpandMore as ExpandMoreIcon,
-  Refresh as RefreshIcon
+  Refresh as RefreshIcon,
+  Close as CloseIcon 
 } from '@mui/icons-material';
 import { useEditor, EditorContent } from '@tiptap/react';
 import StarterKit from '@tiptap/starter-kit';
@@ -82,7 +83,12 @@ const NoteEditor = ({
   const [lockError, setLockError] = useState('');
   const [shareDialogOpen, setShareDialogOpen] = useState(false);
   const [isInitializing, setIsInitializing] = useState(false);
-  
+  const [toolbarExpanded, setToolbarExpanded] = useState(() => {
+    // Remember user's preference
+    const saved = localStorage.getItem('noteEditorToolbarExpanded');
+    return saved ? JSON.parse(saved) : false;
+  }); 
+
   // Image upload states
   const [imageUploadDialog, setImageUploadDialog] = useState(false);
   const [imageUploading, setImageUploading] = useState(false);
@@ -256,8 +262,8 @@ const NoteEditor = ({
       attributes: {
         style: `
           padding: ${isMobile ? '12px' : '16px'}; 
-          font-size: 18px; 
-          line-height: 1.6; 
+          font-size: 16px; 
+          line-height: 1.2; 
           font-family: "Roboto", "Helvetica", "Arial", sans-serif; 
           min-height: ${isMobile ? '200px' : '300px'}; 
           outline: none;
@@ -270,6 +276,12 @@ const NoteEditor = ({
   });
 
   // ===== UTILITY FUNCTIONS =====
+  const toggleToolbar = useCallback(() => {
+    const newState = !toolbarExpanded;
+    setToolbarExpanded(newState);
+    localStorage.setItem('noteEditorToolbarExpanded', JSON.stringify(newState));
+  }, [toolbarExpanded]);
+
   const getCurrentContent = useCallback(() => {
     if (!editor) return '';
     return editor.getHTML();
@@ -1672,24 +1684,24 @@ const NoteEditor = ({
           )}
 
           {/* Desktop Header */}
-          {!isMobile && (
-            <Box sx={{ mb: 2, display: 'flex', alignItems: 'center', gap: 2 }}>
-              <TextField
-                fullWidth
-                variant="outlined"
-                placeholder="Note title..."
-                value={title}
-                onChange={handleTitleChange}
-                onFocus={handleTitleFocus}
-                disabled={!canEdit}
-                sx={{
-                  '& .MuiOutlinedInput-root': {
-                    fontSize: '1.5rem',
-                    fontWeight: 500,
-                  },
-                }}
-              />
-              
+{!isMobile && (
+  <Box sx={{ mb: 2, display: 'flex', alignItems: 'center', gap: 2 }}>
+    <TextField
+      fullWidth
+      variant="outlined"
+      placeholder="Note title..."
+      value={title}
+      onChange={handleTitleChange}
+      onFocus={handleTitleFocus}
+      disabled={!canEdit}
+      sx={{
+        '& .MuiOutlinedInput-root': {
+          fontSize: '1.5rem',
+          fontWeight: 500,
+        },
+      }}
+    />
+
               {/* Status chips */}
               <Box display="flex" gap={1} alignItems="center" flexShrink={0}>
                 {/* NEW: Bulk sync indicator */}
@@ -1792,6 +1804,22 @@ const NoteEditor = ({
                     </IconButton>
                   </Tooltip>
                 )}
+
+      <Tooltip title="Close note">
+        <IconButton
+          onClick={handleBack}
+          color="default"
+          size="small"
+          sx={{
+            '&:hover': {
+              bgcolor: 'action.hover',
+            }
+          }}
+        >
+          <CloseIcon />
+        </IconButton>
+      </Tooltip>
+
               </Box>
             </Box>
           )}
@@ -1866,147 +1894,440 @@ const NoteEditor = ({
               overflow: 'hidden'
             }}>
               {/* Toolbar */}
-              {canEdit && (
-                <Box sx={{ 
-                  borderBottom: 1, 
-                  borderColor: 'divider',
-                  p: 1,
-                  display: 'flex',
-                  gap: 0.5,
-                  flexWrap: 'wrap',
-                  alignItems: 'center'
-                }}>
-                  <ButtonGroup size="small" variant="outlined">
-                    <IconButton
-                      size="small"
-                      onClick={handleUndo}
-                      disabled={!editor?.can().undo()}
-                      title="Undo"
-                    >
-                      <UndoIcon fontSize="small" />
-                    </IconButton>
-                    <IconButton
-                      size="small"
-                      onClick={handleRedo}
-                      disabled={!editor?.can().redo()}
-                      title="Redo"
-                    >
-                      <RedoIcon fontSize="small" />
-                    </IconButton>
-                  </ButtonGroup>
-                  
-                  <Divider orientation="vertical" flexItem sx={{ mx: 0.5 }} />
-                  
-                  <ButtonGroup size="small" variant="outlined">
-                    <IconButton
-                      size="small"
-                      onClick={handleBold}
-                      color={editor?.isActive('bold') ? 'primary' : 'default'}
-                      title="Bold"
-                    >
-                      <BoldIcon fontSize="small" />
-                    </IconButton>
-                    
-                    <IconButton
-                      size="small"
-                      onClick={handleItalic}
-                      color={editor?.isActive('italic') ? 'primary' : 'default'}
-                      title="Italic"
-                    >
-                      <ItalicIcon fontSize="small" />
-                    </IconButton>
-                    
-                    <IconButton
-                      size="small"
-                      onClick={handleUnderline}
-                      color={editor?.isActive('underline') ? 'primary' : 'default'}
-                      title="Underline"
-                    >
-                      <UnderlineIcon fontSize="small" />
-                    </IconButton>
-                    
-                    <IconButton
-                      size="small"
-                      onClick={handleStrikethrough}
-                      color={editor?.isActive('strike') ? 'primary' : 'default'}
-                      title="Strikethrough"
-                    >
-                      <StrikethroughIcon fontSize="small" />
-                    </IconButton>
-                  </ButtonGroup>
-                  
-                  <Divider orientation="vertical" flexItem sx={{ mx: 0.5 }} />
-                  
-                  <ButtonGroup size="small" variant="outlined">
-                    <IconButton
-                      size="small"
-                      onClick={handleBulletList}
-                      color={editor?.isActive('bulletList') ? 'primary' : 'default'}
-                      title="Bullet List"
-                    >
-                      <BulletIcon fontSize="small" />
-                    </IconButton>
-                    
-                    <IconButton
-                      size="small"
-                      onClick={handleOrderedList}
-                      color={editor?.isActive('orderedList') ? 'primary' : 'default'}
-                      title="Numbered List"
-                    >
-                      <NumberIcon fontSize="small" />
-                    </IconButton>
-                    
-                    <IconButton
-                      size="small"
-                      onClick={handleTaskList}
-                      color={editor?.isActive('taskList') ? 'primary' : 'default'}
-                      title="Task List (Checkboxes)"
-                    >
-                      <CheckboxIcon fontSize="small" />
-                    </IconButton>
-                  </ButtonGroup>
-                  
-                  <Divider orientation="vertical" flexItem sx={{ mx: 0.5 }} />
-                  
-                  <ButtonGroup size="small" variant="outlined">
-                    <IconButton
-                      size="small"
-                      onClick={handleBlockquote}
-                      color={editor?.isActive('blockquote') ? 'primary' : 'default'}
-                      title="Quote"
-                    >
-                      <QuoteIcon fontSize="small" />
-                    </IconButton>
-                    
-                    <IconButton
-                      size="small"
-                      onClick={handleCodeBlock}
-                      color={editor?.isActive('codeBlock') ? 'primary' : 'default'}
-                      title="Code Block"
-                    >
-                      <CodeIcon fontSize="small" />
-                    </IconButton>
-                    
-                    <IconButton
-                      size="small"
-                      onClick={handleLink}
-                      color={editor?.isActive('link') ? 'primary' : 'default'}
-                      title="Link"
-                    >
-                      <LinkIcon fontSize="small" />
-                    </IconButton>
-                    
-                    <IconButton
-                      size="small"
-                      onClick={handleImageButton}
-                      title="Insert Image"
-                    >
-                      <ImageIcon fontSize="small" />
-                    </IconButton>
-                  </ButtonGroup>
-                </Box>
-              )}
               
+{/* Enhanced Toolbar with Mobile Optimization */}
+{/* Enhanced Toolbar with Mobile Optimization */}
+{canEdit && (
+  <Box sx={{ 
+    borderBottom: 1, 
+    borderColor: 'divider',
+    p: 1,
+    display: 'flex',
+    flexDirection: isMobile ? 'column' : 'row',
+    gap: 0.5,
+    flexWrap: isMobile ? 'nowrap' : 'wrap',
+    alignItems: 'center'
+  }}>
+    {/* DESKTOP: All tools in one row */}
+    {!isMobile && (
+      <>
+        {/* Undo/Redo */}
+        <ButtonGroup size="small" variant="outlined">
+          <Tooltip title="Undo (Ctrl+Z)">
+            <span>
+              <IconButton
+                size="small"
+                onClick={handleUndo}
+                disabled={!editor?.can().undo()}
+              >
+                <UndoIcon fontSize="small" />
+              </IconButton>
+            </span>
+          </Tooltip>
+          <Tooltip title="Redo (Ctrl+Y)">
+            <span>
+              <IconButton
+                size="small"
+                onClick={handleRedo}
+                disabled={!editor?.can().redo()}
+              >
+                <RedoIcon fontSize="small" />
+              </IconButton>
+            </span>
+          </Tooltip>
+        </ButtonGroup>
+        
+        <Divider orientation="vertical" flexItem sx={{ mx: 0.5 }} />
+        
+        {/* Core formatting */}
+        <ButtonGroup size="small" variant="outlined">
+          <Tooltip title="Bold (Ctrl+B)">
+            <IconButton
+              size="small"
+              onClick={handleBold}
+              color={editor?.isActive('bold') ? 'primary' : 'default'}
+            >
+              <BoldIcon fontSize="small" />
+            </IconButton>
+          </Tooltip>
+          
+          <Tooltip title="Italic (Ctrl+I)">
+            <IconButton
+              size="small"
+              onClick={handleItalic}
+              color={editor?.isActive('italic') ? 'primary' : 'default'}
+            >
+              <ItalicIcon fontSize="small" />
+            </IconButton>
+          </Tooltip>
+          
+          <Tooltip title="Underline (Ctrl+U)">
+            <IconButton
+              size="small"
+              onClick={handleUnderline}
+              color={editor?.isActive('underline') ? 'primary' : 'default'}
+            >
+              <UnderlineIcon fontSize="small" />
+            </IconButton>
+          </Tooltip>
+          
+          <Tooltip title="Strikethrough">
+            <IconButton
+              size="small"
+              onClick={handleStrikethrough}
+              color={editor?.isActive('strike') ? 'primary' : 'default'}
+            >
+              <StrikethroughIcon fontSize="small" />
+            </IconButton>
+          </Tooltip>
+        </ButtonGroup>
+        
+        <Divider orientation="vertical" flexItem sx={{ mx: 0.5 }} />
+        
+        {/* Lists */}
+        <ButtonGroup size="small" variant="outlined">
+          <Tooltip title="Bullet List">
+            <IconButton
+              size="small"
+              onClick={handleBulletList}
+              color={editor?.isActive('bulletList') ? 'primary' : 'default'}
+            >
+              <BulletIcon fontSize="small" />
+            </IconButton>
+          </Tooltip>
+          
+          <Tooltip title="Numbered List">
+            <IconButton
+              size="small"
+              onClick={handleOrderedList}
+              color={editor?.isActive('orderedList') ? 'primary' : 'default'}
+            >
+              <NumberIcon fontSize="small" />
+            </IconButton>
+          </Tooltip>
+          
+          <Tooltip title="Task List">
+            <IconButton
+              size="small"
+              onClick={handleTaskList}
+              color={editor?.isActive('taskList') ? 'primary' : 'default'}
+            >
+              <CheckboxIcon fontSize="small" />
+            </IconButton>
+          </Tooltip>
+        </ButtonGroup>
+        
+        <Divider orientation="vertical" flexItem sx={{ mx: 0.5 }} />
+        
+        {/* Advanced formatting */}
+        <ButtonGroup size="small" variant="outlined">
+          <Tooltip title="Quote">
+            <IconButton
+              size="small"
+              onClick={handleBlockquote}
+              color={editor?.isActive('blockquote') ? 'primary' : 'default'}
+            >
+              <QuoteIcon fontSize="small" />
+            </IconButton>
+          </Tooltip>
+          
+          <Tooltip title="Code Block">
+            <IconButton
+              size="small"
+              onClick={handleCodeBlock}
+              color={editor?.isActive('codeBlock') ? 'primary' : 'default'}
+            >
+              <CodeIcon fontSize="small" />
+            </IconButton>
+          </Tooltip>
+          
+          <Tooltip title="Link (Ctrl+K)">
+            <IconButton
+              size="small"
+              onClick={handleLink}
+              color={editor?.isActive('link') ? 'primary' : 'default'}
+            >
+              <LinkIcon fontSize="small" />
+            </IconButton>
+          </Tooltip>
+          
+          <Tooltip title="Insert Image">
+            <IconButton
+              size="small"
+              onClick={handleImageButton}
+            >
+              <ImageIcon fontSize="small" />
+            </IconButton>
+          </Tooltip>
+        </ButtonGroup>
+      </>
+    )}
+
+    {/* MOBILE: Two-tier collapsible approach */}
+    {isMobile && (
+      <>
+        {/* Primary toolbar - always visible on mobile */}
+        <Box sx={{
+          display: 'flex',
+          gap: 0.5,
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          minWidth: 0,
+          width: '100%'
+        }}>
+          {/* Essential tools container */}
+          <Box sx={{
+            display: 'flex',
+            gap: 0.5,
+            alignItems: 'center',
+            overflow: 'hidden',
+            minWidth: 0,
+            flex: 1,
+          }}>
+            {/* Undo/Redo group */}
+            <ButtonGroup size="small" variant="outlined">
+              <Tooltip title="Undo (Ctrl+Z)">
+                <span>
+                  <IconButton
+                    size="small"
+                    onClick={handleUndo}
+                    disabled={!editor?.can().undo()}
+                    sx={{ minWidth: 36, minHeight: 36 }}
+                  >
+                    <UndoIcon fontSize="small" />
+                  </IconButton>
+                </span>
+              </Tooltip>
+              <Tooltip title="Redo (Ctrl+Y)">
+                <span>
+                  <IconButton
+                    size="small"
+                    onClick={handleRedo}
+                    disabled={!editor?.can().redo()}
+                    sx={{ minWidth: 36, minHeight: 36 }}
+                  >
+                    <RedoIcon fontSize="small" />
+                  </IconButton>
+                </span>
+              </Tooltip>
+            </ButtonGroup>
+            
+            {/* Core formatting group */}
+            <ButtonGroup size="small" variant="outlined">
+              <Tooltip title="Bold (Ctrl+B)">
+                <IconButton
+                  size="small"
+                  onClick={handleBold}
+                  color={editor?.isActive('bold') ? 'primary' : 'default'}
+                  sx={{ minWidth: 36, minHeight: 36 }}
+                >
+                  <BoldIcon fontSize="small" />
+                </IconButton>
+              </Tooltip>
+              
+              <Tooltip title="Italic (Ctrl+I)">
+                <IconButton
+                  size="small"
+                  onClick={handleItalic}
+                  color={editor?.isActive('italic') ? 'primary' : 'default'}
+                  sx={{ minWidth: 36, minHeight: 36 }}
+                >
+                  <ItalicIcon fontSize="small" />
+                </IconButton>
+              </Tooltip>
+            </ButtonGroup>
+            
+            {/* Quick actions */}
+            <Box sx={{ display: 'flex', gap: 0.5 }}>
+              <Tooltip title="Bullet List">
+                <IconButton
+                  size="small"
+                  onClick={handleBulletList}
+                  color={editor?.isActive('bulletList') ? 'primary' : 'default'}
+                  variant="outlined"
+                  sx={{ 
+                    minWidth: 36,
+                    minHeight: 36,
+                    border: '1px solid',
+                    borderColor: 'divider'
+                  }}
+                >
+                  <BulletIcon fontSize="small" />
+                </IconButton>
+              </Tooltip>
+              
+              <Tooltip title="Insert Image">
+                <IconButton
+                  size="small"
+                  onClick={handleImageButton}
+                  variant="outlined"
+                  sx={{ 
+                    minWidth: 36,
+                    minHeight: 36,
+                    border: '1px solid',
+                    borderColor: 'divider'
+                  }}
+                >
+                  <ImageIcon fontSize="small" />
+                </IconButton>
+              </Tooltip>
+            </Box>
+          </Box>
+          
+          {/* Expand/collapse toggle */}
+          <Tooltip title={toolbarExpanded ? "Hide extra tools" : "Show more tools"}>
+            <IconButton
+              size="small"
+              onClick={toggleToolbar}
+              color={toolbarExpanded ? 'primary' : 'default'}
+              sx={{
+                minWidth: 36,
+                minHeight: 36,
+                transition: 'all 0.2s ease-in-out',
+                bgcolor: toolbarExpanded ? 'action.selected' : 'transparent',
+                '&:hover': {
+                  bgcolor: toolbarExpanded ? 'action.selected' : 'action.hover',
+                }
+              }}
+            >
+              {toolbarExpanded ? 
+                <ExpandLessIcon fontSize="small" /> : 
+                <ExpandMoreIcon fontSize="small" />
+              }
+            </IconButton>
+          </Tooltip>
+        </Box>
+        
+        {/* Secondary toolbar - collapsible on mobile */}
+        <Collapse 
+          in={toolbarExpanded}
+          timeout={300}
+        >
+          <Box sx={{
+            display: 'flex',
+            gap: 0.5,
+            alignItems: 'center',
+            flexWrap: 'nowrap',
+            overflowX: 'auto',
+            overflowY: 'hidden',
+            pb: 0.5,
+            pt: 0.5,
+            width: '100%',
+            // Custom scrollbar for mobile
+            '&::-webkit-scrollbar': {
+              height: 4,
+            },
+            '&::-webkit-scrollbar-track': {
+              background: 'transparent',
+            },
+            '&::-webkit-scrollbar-thumb': {
+              background: 'rgba(0, 0, 0, 0.2)',
+              borderRadius: 2,
+            },
+          }}>
+            {/* Additional formatting */}
+            <ButtonGroup size="small" variant="outlined" sx={{ flexShrink: 0 }}>
+              <Tooltip title="Underline (Ctrl+U)">
+                <IconButton
+                  size="small"
+                  onClick={handleUnderline}
+                  color={editor?.isActive('underline') ? 'primary' : 'default'}
+                >
+                  <UnderlineIcon fontSize="small" />
+                </IconButton>
+              </Tooltip>
+              
+              <Tooltip title="Strikethrough">
+                <IconButton
+                  size="small"
+                  onClick={handleStrikethrough}
+                  color={editor?.isActive('strike') ? 'primary' : 'default'}
+                >
+                  <StrikethroughIcon fontSize="small" />
+                </IconButton>
+              </Tooltip>
+            </ButtonGroup>
+            
+            <Divider orientation="vertical" flexItem sx={{ mx: 0.5 }} />
+            
+            {/* List tools */}
+            <ButtonGroup size="small" variant="outlined" sx={{ flexShrink: 0 }}>
+              <Tooltip title="Numbered List">
+                <IconButton
+                  size="small"
+                  onClick={handleOrderedList}
+                  color={editor?.isActive('orderedList') ? 'primary' : 'default'}
+                >
+                  <NumberIcon fontSize="small" />
+                </IconButton>
+              </Tooltip>
+              
+              <Tooltip title="Task List">
+                <IconButton
+                  size="small"
+                  onClick={handleTaskList}
+                  color={editor?.isActive('taskList') ? 'primary' : 'default'}
+                >
+                  <CheckboxIcon fontSize="small" />
+                </IconButton>
+              </Tooltip>
+            </ButtonGroup>
+            
+            <Divider orientation="vertical" flexItem sx={{ mx: 0.5 }} />
+            
+            {/* Advanced formatting */}
+            <ButtonGroup size="small" variant="outlined" sx={{ flexShrink: 0 }}>
+              <Tooltip title="Quote">
+                <IconButton
+                  size="small"
+                  onClick={handleBlockquote}
+                  color={editor?.isActive('blockquote') ? 'primary' : 'default'}
+                >
+                  <QuoteIcon fontSize="small" />
+                </IconButton>
+              </Tooltip>
+              
+              <Tooltip title="Code Block">
+                <IconButton
+                  size="small"
+                  onClick={handleCodeBlock}
+                  color={editor?.isActive('codeBlock') ? 'primary' : 'default'}
+                >
+                  <CodeIcon fontSize="small" />
+                </IconButton>
+              </Tooltip>
+              
+              <Tooltip title="Link (Ctrl+K)">
+                <IconButton
+                  size="small"
+                  onClick={handleLink}
+                  color={editor?.isActive('link') ? 'primary' : 'default'}
+                >
+                  <LinkIcon fontSize="small" />
+                </IconButton>
+              </Tooltip>
+            </ButtonGroup>
+            
+            {/* Show hint on mobile when expanded */}
+            <Typography 
+              variant="caption" 
+              color="text.secondary" 
+              sx={{ 
+                ml: 2, 
+                flexShrink: 0,
+                opacity: 0.7,
+                fontSize: '0.7rem'
+              }}
+            >
+              Swipe to see more →
+            </Typography>
+          </Box>
+        </Collapse>
+      </>
+    )}
+  </Box>
+)}
+
               {/* Editor Content */}
               <Box sx={{ 
                 flexGrow: 1,
@@ -2025,9 +2346,9 @@ const NoteEditor = ({
                   '& h3': { fontSize: '1.5rem', fontWeight: 600, margin: '1rem 0 0.5rem' },
                   '& h4': { fontSize: '1.25rem', fontWeight: 600, margin: '1rem 0 0.5rem' },
                   '& h5': { fontSize: '1.125rem', fontWeight: 600, margin: '1rem 0 0.5rem' },
-                  '& h6': { fontSize: '1rem', fontWeight: 600, margin: '1rem 0 0.5rem' },
-                  '& p': { margin: '0.5rem 0' },
-                  '& ul, & ol': { margin: '0.5rem 0', paddingLeft: '1.5rem' },
+                  '& h6': { fontSize: '1rem', fontWeight: 600, margin: '1rem 0 0.3rem' },
+                  '& p': { margin: '0.3rem 0' },
+                  '& ul, & ol': { margin: '0.3rem 0', paddingLeft: '1.5rem' },
                   '& .tiptap-task-list': {
                     listStyle: 'none',
                     padding: 0,
