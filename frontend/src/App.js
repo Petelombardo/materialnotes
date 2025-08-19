@@ -31,13 +31,15 @@ import {
   Wifi as WifiIcon,
   WifiOff as WifiOffIcon,
   Smartphone,
-  AutoAwesome as AutoAwesomeIcon
+  AutoAwesome as AutoAwesomeIcon,
+  FlashOn as RealtimeIcon
 } from '@mui/icons-material';
 import Login from './components/Login';
 import NoteEditor from './components/NoteEditor';
 import NotesList from './components/NotesList';
 import OfflineStatus from './components/OfflineStatus';
 import api from './utils/api';
+import websocketService from './services/websocketService';
 
 function App() {
   const [user, setUser] = useState(null);
@@ -65,6 +67,16 @@ function App() {
   const [lastBulkSync, setLastBulkSync] = useState(null);
   const [appLifecycleStatus, setAppLifecycleStatus] = useState('active');
   
+  // WebSocket state
+  const [websocketConnected, setWebsocketConnected] = useState(false);
+  const [connectionMode, setConnectionMode] = useState('connecting'); // 'connecting', 'websocket', 'http', 'offline'
+  const [realtimeActive, setRealtimeActive] = useState(false);
+  
+  // NEW: Enhanced lifecycle state variables
+  const [appVisibility, setAppVisibility] = useState('visible');
+  const [reconnectAttempts, setReconnectAttempts] = useState(0);
+  const [lastActivityTime, setLastActivityTime] = useState(Date.now());
+  
   // Responsive breakpoints
   const theme = useTheme();
   const isMobile = useMediaQuery(theme.breakpoints.down('md'), {
@@ -73,7 +85,264 @@ function App() {
   });
   const isTablet = useMediaQuery(theme.breakpoints.between('md', 'lg'));
 
-  // Helper functions (unchanged)
+  // ===== WEBSOCKET INTEGRATION =====
+  
+  // Initialize WebSocket connection
+  const initializeWebSocket = async () => {
+    if (!user) {
+      console.log('⚠️ No user available for WebSocket initialization');
+      return;
+    }
+
+    try {
+      const token = localStorage.getItem('token');
+      if (!token) {
+        console.warn('⚠️ No auth token available for WebSocket');
+        setConnectionMode('http');
+        return;
+      }
+
+      console.log('🔌 Initializing WebSocket connection...');
+      setConnectionMode('connecting');
+      
+      await websocketService.connect(token);
+      
+      setWebsocketConnected(true);
+      setConnectionMode('websocket');
+      console.log('✅ WebSocket connected successfully');
+      
+      // Stop HTTP polling since we have WebSocket
+      stopHttpPolling();
+      
+    } catch (error) {
+      console.error('❌ WebSocket initialization failed:', error);
+      setWebsocketConnected(false);
+      setConnectionMode('http');
+      
+      // Fall back to HTTP polling
+      console.log('🔄 Falling back to HTTP polling');
+      startHttpPolling();
+    }
+  };
+
+  // Setup WebSocket event listeners
+  const setupWebSocketListeners = () => {
+    if (!websocketService) return;
+
+    // Connection events
+    websocketService.on('connection-restored', () => {
+      console.log('🔌 WebSocket connection restored');
+      setWebsocketConnected(true);
+      setConnectionMode('websocket');
+      stopHttpPolling();
+    });
+
+    websocketService.on('connection-lost', () => {
+      console.log('🔌 WebSocket connection lost');
+      setWebsocketConnected(false);
+      setConnectionMode('http');
+      setRealtimeActive(false);
+      
+      // Fall back to HTTP polling
+      startHttpPolling();
+    });
+
+    websocketService.on('connection-failed', () => {
+      console.log('❌ WebSocket connection failed permanently');
+      setWebsocketConnected(false);
+      setConnectionMode('http');
+      setRealtimeActive(false);
+      
+      // Fall back to HTTP polling
+      startHttpPolling();
+    });
+
+    // Real-time collaboration events
+    websocketService.on('note-updated', (data) => {
+      console.log('📝 Real-time note update received in App.js:', data);
+      
+      // Update the specific note in our notes array
+      setNotes(prevNotes => {
+        return prevNotes.map(note => {
+          if (note.id === data.noteId) {
+            return {
+              ...note,
+              title: data.updates.title || note.title,
+              content: data.updates.content || note.content,
+              updatedAt: data.timestamp || data.updatedAt,
+              lastEditedBy: data.editor?.id,
+              lastEditorName: data.editor?.name,
+              lastEditorAvatar: data.editor?.avatar
+            };
+          }
+          return note;
+        });
+      });
+      
+      // Update timestamps
+      setNotesTimestamps(prev => {
+        const updated = new Map(prev);
+        updated.set(data.noteId, new Date(data.timestamp || data.updatedAt).getTime());
+        return updated;
+      });
+    });
+
+    websocketService.on('bulk-sync-response', (data) => {
+      console.log('📱 Bulk sync response received:', data);
+      // Handle bulk sync response if needed
+    });
+
+    websocketService.on('websocket-error', (error) => {
+      console.error('❌ WebSocket error:', error);
+      setConnectionMode('http');
+    });
+  };
+
+  // NEW: Enhanced reconnectWebSocket function
+const reconnectWebSocket = async () => {
+  // IMPROVED: More thorough user and connectivity checks
+  if (!isOnline) {
+    console.log('⚠️ Cannot reconnect WebSocket - offline');
+    return;
+  }
+
+  if (!user) {
+    console.log('⚠️ Cannot reconnect WebSocket - no user available');
+    console.log('🔄 Attempting to restore user session from token...');
+    
+    const token = localStorage.getItem('token');
+    if (!token) {
+      console.log('❌ No token available for user restoration');
+      setConnectionMode('http');
+      startHttpPolling();
+      return;
+    }
+
+    try {
+      // Try to restore user session
+      api.api.defaults.headers.common['Authorization'] = `Bearer ${token}`;
+      const userData = await api.getCurrentUser();
+      
+      if (!userData) {
+        console.log('❌ Could not restore user session');
+        setConnectionMode('http');
+        startHttpPolling();
+        return;
+      }
+      
+      console.log('✅ User session restored successfully:', userData.email);
+      setUser(userData);
+      
+      // Now continue with WebSocket connection using restored user
+      // Don't return here, continue to the connection logic below
+    } catch (error) {
+      console.error('❌ Failed to restore user session:', error);
+      setConnectionMode('http');
+      startHttpPolling();
+      return;
+    }
+  }
+
+  try {
+    console.log('🔄 Attempting WebSocket reconnection...');
+    setConnectionMode('connecting');
+    setReconnectAttempts(prev => prev + 1);
+    
+    // Disconnect existing connection first
+    if (websocketService) {
+      websocketService.disconnect();
+    }
+    
+    // Small delay to ensure clean disconnection
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    
+    const token = localStorage.getItem('token');
+    if (!token) {
+      throw new Error('No auth token available');
+    }
+
+    console.log('🔌 Connecting WebSocket with token...');
+    await websocketService.connect(token);
+    
+    setWebsocketConnected(true);
+    setConnectionMode('websocket');
+    setReconnectAttempts(0);
+    
+    console.log('✅ WebSocket reconnected successfully');
+    
+    // Stop HTTP polling since we have WebSocket again
+    stopHttpPolling();
+    
+    // If we have a selected note, rejoin its collaboration
+    if (selectedNote) {
+      console.log('🤝 Rejoining note collaboration after reconnect');
+      setTimeout(() => {
+        websocketService.joinNote(selectedNote.id);
+      }, 500);
+    }
+    
+  } catch (error) {
+    console.error('❌ WebSocket reconnection failed:', error);
+    setWebsocketConnected(false);
+    setConnectionMode('http');
+    
+    // Fall back to HTTP polling
+    console.log('🔄 Falling back to HTTP polling after reconnection failure');
+    startHttpPolling();
+    
+    // Retry reconnection with exponential backoff (max 3 attempts)
+    if (reconnectAttempts < 3) {
+      const delay = Math.min(5000 * Math.pow(2, reconnectAttempts), 30000);
+      console.log(`🔄 Will retry WebSocket reconnection in ${delay/1000}s (attempt ${reconnectAttempts + 1}/3)`);
+      
+      setTimeout(() => {
+        if (isOnline && !websocketConnected) {
+          reconnectWebSocket();
+        }
+      }, delay);
+    } else {
+      console.log('❌ Max WebSocket reconnection attempts reached, staying on HTTP polling');
+    }
+  }
+};
+
+  // Start HTTP polling (fallback only)
+  const startHttpPolling = () => {
+    // Only start HTTP polling if WebSocket is not connected
+    if (websocketConnected) {
+      console.log('⚠️ Skipping HTTP polling - WebSocket active');
+      return;
+    }
+
+    if (refreshIntervalId) {
+      console.log('🛑 Stopping existing HTTP polling before starting new one');
+      clearInterval(refreshIntervalId);
+    }
+    
+    console.log('🔄 Starting HTTP polling fallback (every 30 seconds)');
+    
+    const intervalId = setInterval(() => {
+      // Only poll if WebSocket is not connected
+      if (!websocketConnected) {
+        console.log('⏰ HTTP polling interval triggered');
+        checkForNoteUpdates(true);
+      }
+    }, 30000);
+    
+    setRefreshIntervalId(intervalId);
+  };
+
+  // Stop HTTP polling
+  const stopHttpPolling = () => {
+    if (refreshIntervalId) {
+      console.log('🛑 Stopping HTTP polling');
+      clearInterval(refreshIntervalId);
+      setRefreshIntervalId(null);
+    }
+  };
+
+  // ===== EXISTING HELPER FUNCTIONS =====
+  
   const saveTemporaryNotesToStorage = (notes) => {
     const tempNotes = notes.filter(note => note.id.startsWith('temp_'));
     localStorage.setItem('tempNotes', JSON.stringify(tempNotes));
@@ -108,15 +377,21 @@ function App() {
     }
   };
 
-  // Enhanced note update handling for bulk sync
+  // Enhanced note update handling (HTTP fallback only)
   const checkForNoteUpdates = async (silent = true) => {
+    // Skip if WebSocket is handling updates
+    if (websocketConnected) {
+      if (!silent) console.log('⚠️ Skipping HTTP update check - WebSocket active');
+      return;
+    }
+
     if (!user || !isOnline) {
-      if (!silent) console.log('🔍 Skipping note updates check - user:', !!user, 'online:', isOnline);
+      if (!silent) console.log('📝 Skipping note updates check - user:', !!user, 'online:', isOnline);
       return;
     }
     
     try {
-      if (!silent) console.log('🔍 Checking for note updates...');
+      if (!silent) console.log('📝 Checking for note updates via HTTP...');
       
       const response = await api.get('/api/notes');
       const serverNotes = response.data || [];
@@ -144,7 +419,7 @@ function App() {
               hasBeenShared: note.hasBeenShared,
               lastEditor: note.lastEditorName || 'Unknown'
             });
-            console.log('🔄 Note updated detected:', {
+            console.log('🔄 Note updated detected via HTTP:', {
               id: note.id,
               title: note.title || 'Untitled',
               shared: note.shared,
@@ -163,14 +438,14 @@ function App() {
         setNotesTimestamps(newTimestamps);
         
         if (hasUpdates) {
-          console.log('✅ Applied updates to', updatedNotes.length, 'notes:', updatedNotes);
+          console.log('✅ Applied HTTP updates to', updatedNotes.length, 'notes:', updatedNotes);
         }
         
         // Update selected note if it was changed
         if (selectedNote) {
           const updatedSelectedNote = allNotes.find(note => note.id === selectedNote.id);
           if (updatedSelectedNote && updatedSelectedNote.updatedAt !== selectedNote.updatedAt) {
-            console.log('🔄 Updating selected note:', {
+            console.log('🔄 Updating selected note via HTTP:', {
               id: selectedNote.id,
               title: selectedNote.title || 'Untitled',
               oldTime: selectedNote.updatedAt,
@@ -181,22 +456,22 @@ function App() {
         }
         
         if (hasUpdates && !silent) {
-          console.log('🔄 Notes updated from server');
+          console.log('🔄 Notes updated from server via HTTP');
         }
       } else {
-        if (!silent) console.log('✅ No note updates detected');
+        if (!silent) console.log('✅ No note updates detected via HTTP');
       }
       
     } catch (error) {
       if (!silent) {
-        console.error('❌ Failed to check for note updates:', error);
+        console.error('❌ Failed to check for note updates via HTTP:', error);
       }
     }
   };
 
-  // NEW: Handle notes updated from bulk sync in NoteEditor
+  // Handle notes updated from WebSocket or bulk sync
   const handleNotesUpdated = (updatedNotes) => {
-    console.log('📥 Handling bulk sync note updates from NoteEditor:', updatedNotes.length);
+    console.log('🔥 Handling note updates from WebSocket/bulk sync:', updatedNotes.length);
     
     // Update the notes state with the new data
     setNotes(prevNotes => {
@@ -227,7 +502,7 @@ function App() {
     if (selectedNote) {
       const updatedSelectedNote = updatedNotes.find(note => note.id === selectedNote.id);
       if (updatedSelectedNote) {
-        console.log('🔄 Updating selected note from bulk sync');
+        console.log('🔄 Updating selected note from WebSocket/bulk sync');
         setSelectedNote(updatedSelectedNote);
       }
     }
@@ -282,36 +557,6 @@ function App() {
       if (!api.isNetworkError(error) && isOnline) {
         setErrorMessage('Failed to load notes. Please try again.');
       }
-    }
-  };
-
-  // Enhanced auto-refresh management
-  const startAutoRefresh = () => {
-    if (refreshIntervalId) {
-      console.log('🛑 Stopping existing auto-refresh before starting new one');
-      clearInterval(refreshIntervalId);
-    }
-    
-    console.log('🚀 Starting auto-refresh for notes (every 30 seconds)');
-    
-    // Increased interval to be less aggressive
-    const intervalId = setInterval(() => {
-      console.log('⏰ Auto-refresh interval triggered');
-      checkForNoteUpdates(true);
-    }, 30000); // Changed from 10s to 30s to be less aggressive
-    
-    setRefreshIntervalId(intervalId);
-    console.log('✅ Auto-refresh started with interval ID:', intervalId);
-  };
-
-  const stopAutoRefresh = () => {
-    if (refreshIntervalId) {
-      console.log('🛑 Stopping auto-refresh, interval ID:', refreshIntervalId);
-      clearInterval(refreshIntervalId);
-      setRefreshIntervalId(null);
-      console.log('✅ Auto-refresh stopped');
-    } else {
-      console.log('ℹ️ No auto-refresh to stop (interval ID was null)');
     }
   };
 
@@ -376,97 +621,322 @@ function App() {
     console.log('Finished syncing temporary notes');
   };
 
-  const setupOfflineListeners = () => {
-    const handleBrowserOnline = async () => {
-      console.log('Browser detected: online');
-      setIsOnline(true);
-      setRetryCount(0);
-      setErrorMessage('');
-      
-      setTimeout(async () => {
-        try {
-          console.log('Triggering sync after coming online...');
-          await syncTemporaryNotes();
-          await loadNotes();
-          startAutoRefresh();
-        } catch (error) {
-          console.error('Failed to sync temporary notes:', error);
-        }
-      }, 2000);
-    };
-
-    const handleBrowserOffline = () => {
-      console.log('Browser detected: offline');
-      setIsOnline(false);
-      stopAutoRefresh();
-    };
-
-    window.addEventListener('online', handleBrowserOnline);
-    window.addEventListener('offline', handleBrowserOffline);
+  // NEW: Enhanced setupOfflineListeners with standby/resume handling
+const setupOfflineListeners = () => {
+  const handleBrowserOnline = async () => {
+    console.log('🌐 Browser detected: online');
+    setIsOnline(true);
+    setRetryCount(0);
+    setErrorMessage('');
     
-    setIsOnline(navigator.onLine);
-
-    api.addEventListener('online', async () => {
-      console.log('API detected: online');
-      setIsOnline(true);
-      setRetryCount(0);
-      setErrorMessage('');
-      
-      setTimeout(async () => {
-        try {
-          console.log('API online - triggering sync...');
-          await syncTemporaryNotes();
-          await loadNotes();
-          startAutoRefresh();
-        } catch (error) {
-          console.error('Failed to sync temporary notes:', error);
-        }
-      }, 2000);
-    });
-    
-    api.addEventListener('offline', () => {
-      console.log('API detected: offline');
-      setIsOnline(false);
-      stopAutoRefresh();
-    });
-    
-    api.addEventListener('sync-start', () => setSyncInProgress(true));
-    api.addEventListener('sync-complete', () => {
-      setSyncInProgress(false);
-      setRetryCount(0);
-      loadNotes();
-    });
-    
-    api.addEventListener('sync-error', (event) => {
-      setSyncInProgress(false);
-      const error = event.detail.error;
-      console.error('Sync error:', error);
-      
-      if (retryCount < maxRetries) {
-        setRetryCount(prev => prev + 1);
-        setTimeout(() => {
-          if (isOnline) {
-            api.forcSync();
+    // Add a small delay to ensure network is actually stable
+    setTimeout(async () => {
+      try {
+        console.log('🔄 Triggering sync after coming online...');
+        await syncTemporaryNotes();
+        await loadNotes();
+        
+        // FIXED: Only try to reconnect WebSocket if user is available
+        // Check user state at the time of reconnection, not when this function was defined
+        if (user) {
+          console.log('🔄 User available, attempting WebSocket reconnection...');
+          await reconnectWebSocket();
+        } else {
+          console.log('⚠️ User not available during online event, checking auth state...');
+          // If user is not available, try to restore auth first
+          const token = localStorage.getItem('token');
+          if (token) {
+            console.log('🔑 Token exists, attempting to restore user session...');
+            try {
+              api.api.defaults.headers.common['Authorization'] = `Bearer ${token}`;
+              const userData = await api.getCurrentUser();
+              if (userData) {
+                console.log('✅ User session restored, now attempting WebSocket...');
+                setUser(userData);
+                // Wait a bit for user state to update, then try WebSocket
+                setTimeout(() => {
+                  if (userData) { // Use the fresh userData, not state
+                    reconnectWebSocket();
+                  }
+                }, 1000);
+              } else {
+                console.log('❌ Could not restore user session');
+                setConnectionMode('http');
+                startHttpPolling();
+              }
+            } catch (error) {
+              console.error('❌ Failed to restore user session:', error);
+              setConnectionMode('http');
+              startHttpPolling();
+            }
+          } else {
+            console.log('❌ No token available, user needs to re-authenticate');
+            setConnectionMode('offline');
           }
-        }, 5000 * (retryCount + 1));
-      } else {
-        setErrorMessage('Failed to sync changes after multiple attempts. Your notes are saved locally and will sync when connection improves.');
-        setShowErrorDialog(true);
+        }
+      } catch (error) {
+        console.error('❌ Failed to sync after coming online:', error);
       }
-    });
-    
-    api.addEventListener('offline-change', () => {
-      loadNotes();
-    });
-
-    return () => {
-      window.removeEventListener('online', handleBrowserOnline);
-      window.removeEventListener('offline', handleBrowserOffline);
-      stopAutoRefresh();
-    };
+    }, 1000);
   };
 
-  // Create note function (unchanged)
+  const handleBrowserOffline = () => {
+    console.log('📱 Browser detected: offline');
+    setIsOnline(false);
+    setConnectionMode('offline');
+    setWebsocketConnected(false);
+    stopHttpPolling();
+    // DON'T clear user state here - keep it for when we come back online
+  };
+
+  // Enhanced visibility change handler with better state preservation
+  const handleVisibilityChange = async () => {
+    const currentTime = Date.now();
+    const wasHidden = appVisibility === 'hidden';
+    const isNowVisible = document.visibilityState === 'visible';
+    
+    setAppVisibility(document.visibilityState);
+    
+    console.log(`👁️ App visibility changed: ${document.visibilityState}`);
+    
+    if (wasHidden && isNowVisible) {
+      const timeSinceHidden = currentTime - lastActivityTime;
+      console.log(`📱 App resumed after ${Math.round(timeSinceHidden / 1000)}s`);
+      
+      // Update last activity time AFTER calculating the difference
+      setLastActivityTime(currentTime);
+      
+      // If we were hidden for more than 30 seconds, assume connections were lost
+      if (timeSinceHidden > 30000) {
+        console.log('🔄 Long sleep detected, forcing reconnection...');
+        
+        // Reset connection state but preserve user state
+        setWebsocketConnected(false);
+        setConnectionMode('connecting');
+        
+        // Check actual connectivity first
+        try {
+          const response = await fetch('/health', { 
+            method: 'GET', 
+            cache: 'no-cache',
+            headers: { 'Cache-Control': 'no-cache' }
+          });
+          
+          if (response.ok) {
+            console.log('✅ Network connectivity confirmed after resume');
+            setIsOnline(true);
+            
+            // FIXED: Check user state before attempting reconnection
+            const currentUser = user; // Capture current user state
+            if (currentUser) {
+              console.log('🔄 User available after resume, reconnecting WebSocket...');
+              await reconnectWebSocket();
+            } else {
+              console.log('⚠️ User not available after resume, checking auth...');
+              // Try to restore user session
+              const token = localStorage.getItem('token');
+              if (token) {
+                try {
+                  api.api.defaults.headers.common['Authorization'] = `Bearer ${token}`;
+                  const userData = await api.getCurrentUser();
+                  if (userData) {
+                    console.log('✅ User session restored after resume');
+                    setUser(userData);
+                    setTimeout(() => reconnectWebSocket(), 1000);
+                  } else {
+                    console.log('❌ Could not restore user session after resume');
+                    setConnectionMode('http');
+                    startHttpPolling();
+                  }
+                } catch (error) {
+                  console.error('❌ Auth restoration failed after resume:', error);
+                  setConnectionMode('http');
+                  startHttpPolling();
+                }
+              } else {
+                console.log('❌ No token available after resume');
+                setConnectionMode('offline');
+              }
+            }
+          } else {
+            throw new Error('Health check failed');
+          }
+        } catch (error) {
+          console.log('❌ Network not available after resume');
+          setIsOnline(false);
+          setConnectionMode('offline');
+        }
+      } else if (!websocketConnected && isOnline) {
+        // Short sleep, just reconnect WebSocket if needed
+        console.log('🔄 Quick reconnection after short sleep...');
+        if (user) {
+          await reconnectWebSocket();
+        } else {
+          console.log('⚠️ User not available for quick reconnection, starting HTTP polling');
+          setConnectionMode('http');
+          startHttpPolling();
+        }
+      }
+    } else {
+      // Update last activity time when hiding
+      setLastActivityTime(currentTime);
+    }
+  };
+
+  // Page focus/blur handlers (additional layer)
+  const handleFocus = async () => {
+    console.log('🔍 Window focused');
+    setLastActivityTime(Date.now());
+    
+    // Quick connectivity check on focus
+    if (!websocketConnected && isOnline && user) {
+      console.log('🔄 Quick reconnection on window focus...');
+      setTimeout(() => reconnectWebSocket(), 500);
+    }
+  };
+
+  const handleBlur = () => {
+    console.log('😴 Window blurred');
+    setLastActivityTime(Date.now());
+  };
+
+  // Page freeze/resume handlers (iOS Safari specific)
+  const handleFreeze = () => {
+    console.log('🧊 Page frozen (iOS/mobile specific)');
+    setLastActivityTime(Date.now());
+  };
+
+  const handleResume = async () => {
+    console.log('🔥 Page resumed (iOS/mobile specific)');
+    const currentTime = Date.now();
+    const timeFrozen = currentTime - lastActivityTime;
+    
+    console.log(`📱 Page was frozen for ${Math.round(timeFrozen / 1000)}s`);
+    
+    if (timeFrozen > 10000) { // More than 10 seconds
+      console.log('🔄 Long freeze detected, forcing reconnection...');
+      setLastActivityTime(currentTime); // Update time before calling visibility logic
+      await handleVisibilityChange(); // Reuse the visibility logic
+    }
+  };
+
+  // Set up all event listeners
+  window.addEventListener('online', handleBrowserOnline);
+  window.addEventListener('offline', handleBrowserOffline);
+  window.addEventListener('focus', handleFocus);
+  window.addEventListener('blur', handleBlur);
+  document.addEventListener('visibilitychange', handleVisibilityChange);
+  
+  // iOS specific events
+  document.addEventListener('freeze', handleFreeze);
+  document.addEventListener('resume', handleResume);
+  
+  // Page lifecycle events
+  window.addEventListener('pageshow', (event) => {
+    if (event.persisted) {
+      console.log('📄 Page restored from cache');
+      setTimeout(() => {
+        if (user) {
+          reconnectWebSocket();
+        } else {
+          console.log('⚠️ User not available from cache restore');
+        }
+      }, 1000);
+    }
+  });
+
+  // Set initial states
+  setIsOnline(navigator.onLine);
+  setAppVisibility(document.visibilityState);
+  setLastActivityTime(Date.now()); // Initialize activity time
+  
+  if (!navigator.onLine) {
+    setConnectionMode('offline');
+  }
+
+  // API event listeners
+  api.addEventListener('online', async () => {
+    console.log('🔗 API detected: online');
+    setIsOnline(true);
+    setRetryCount(0);
+    setErrorMessage('');
+    
+    setTimeout(async () => {
+      try {
+        console.log('API online - triggering sync...');
+        await syncTemporaryNotes();
+        await loadNotes();
+        
+        // FIXED: Check user state before attempting WebSocket reconnection
+        if (user) {
+          console.log('🔗 User available, attempting WebSocket reconnection via API event...');
+          await reconnectWebSocket();
+        } else {
+          console.log('⚠️ User not available during API online event');
+          setConnectionMode('http');
+          startHttpPolling();
+        }
+      } catch (error) {
+        console.error('Failed to sync after API online:', error);
+      }
+    }, 1000);
+  });
+  
+  api.addEventListener('offline', () => {
+    console.log('🔗 API detected: offline');
+    setIsOnline(false);
+    setConnectionMode('offline');
+    setWebsocketConnected(false);
+    stopHttpPolling();
+    // DON'T clear user state here
+  });
+  
+  api.addEventListener('sync-start', () => setSyncInProgress(true));
+  api.addEventListener('sync-complete', () => {
+    setSyncInProgress(false);
+    setRetryCount(0);
+    loadNotes();
+  });
+  
+  api.addEventListener('sync-error', (event) => {
+    setSyncInProgress(false);
+    const error = event.detail.error;
+    console.error('Sync error:', error);
+    
+    if (retryCount < maxRetries) {
+      setRetryCount(prev => prev + 1);
+      setTimeout(() => {
+        if (isOnline) {
+          api.forcSync();
+        }
+      }, 5000 * (retryCount + 1));
+    } else {
+      setErrorMessage('Failed to sync changes after multiple attempts. Your notes are saved locally and will sync when connection improves.');
+      setShowErrorDialog(true);
+    }
+  });
+  
+  api.addEventListener('offline-change', () => {
+    loadNotes();
+  });
+
+  // Cleanup function
+  return () => {
+    window.removeEventListener('online', handleBrowserOnline);
+    window.removeEventListener('offline', handleBrowserOffline);
+    window.removeEventListener('focus', handleFocus);
+    window.removeEventListener('blur', handleBlur);
+    document.removeEventListener('visibilitychange', handleVisibilityChange);
+    document.removeEventListener('freeze', handleFreeze);
+    document.removeEventListener('resume', handleResume);
+    stopHttpPolling();
+  };
+};
+
+// STOP
+// STOP
+
+  // Create note function
   const createNote = async () => {
     try {
       if (pendingSave && selectedNote) {
@@ -681,9 +1151,23 @@ function App() {
       if (cleanupOfflineListeners) {
         cleanupOfflineListeners();
       }
-      stopAutoRefresh();
+      stopHttpPolling();
+      
+      // Cleanup WebSocket
+      if (websocketService) {
+        websocketService.disconnect();
+      }
     };
   }, []);
+
+  // Setup WebSocket when user is authenticated
+  useEffect(() => {
+    if (user) {
+      console.log('🔌 User authenticated, setting up WebSocket...');
+      setupWebSocketListeners();
+      initializeWebSocket();
+    }
+  }, [user]);
 
   // Event handlers
   const handleNoteSelect = async (note) => {
@@ -786,9 +1270,7 @@ function App() {
         setUser(userData);
         await loadNotes();
         
-        if (isOnline) {
-          startAutoRefresh();
-        }
+        // Note: WebSocket initialization happens in useEffect when user is set
         
         const urlParams = new URLSearchParams(window.location.search);
         if (urlParams.get('action') === 'new') {
@@ -805,9 +1287,6 @@ function App() {
               console.log('Second attempt successful:', userData2.email);
               setUser(userData2);
               await loadNotes();
-              if (isOnline) {
-                startAutoRefresh();
-              }
             } else {
               console.log('Second attempt also failed, clearing auth');
               await handleAuthFailure();
@@ -839,7 +1318,12 @@ function App() {
   };
 
   const handleAuthFailure = async () => {
-    stopAutoRefresh();
+    stopHttpPolling();
+    if (websocketService) {
+      websocketService.disconnect();
+    }
+    setWebsocketConnected(false);
+    setConnectionMode('offline');
     localStorage.removeItem('token');
     delete api.api.defaults.headers.common['Authorization'];
     await api.clearAuthData();
@@ -857,7 +1341,12 @@ function App() {
       console.error('Logout request failed:', error);
     }
     
-    stopAutoRefresh();
+    stopHttpPolling();
+    if (websocketService) {
+      websocketService.disconnect();
+    }
+    setWebsocketConnected(false);
+    setConnectionMode('offline');
     localStorage.removeItem('token');
     delete api.api.defaults.headers.common['Authorization'];
     await api.clearAuthData();
@@ -877,8 +1366,10 @@ function App() {
           setErrorMessage('Sync failed. Please check your connection.');
           setShowErrorDialog(true);
         } else {
-          // Force a refresh after manual sync
-          await checkForNoteUpdates(false);
+          // Force a refresh after manual sync (only if using HTTP)
+          if (!websocketConnected) {
+            await checkForNoteUpdates(false);
+          }
         }
       } catch (error) {
         console.error('Manual sync failed:', error);
@@ -902,12 +1393,35 @@ function App() {
 
   const getConnectionStatusColor = () => {
     if (syncInProgress) return 'info';
-    return isOnline ? 'success' : 'warning';
+    switch (connectionMode) {
+      case 'websocket': return 'success';
+      case 'http': return 'warning';
+      case 'offline': return 'error';
+      case 'connecting': return 'info';
+      default: return 'warning';
+    }
   };
 
   const getConnectionStatusLabel = () => {
     if (syncInProgress) return 'Syncing...';
-    return isOnline ? 'Online' : 'Offline';
+    switch (connectionMode) {
+      case 'websocket': return 'Real-time';
+      case 'http': return 'HTTP sync';
+      case 'offline': return 'Offline';
+      case 'connecting': return 'Connecting...';
+      default: return 'Unknown';
+    }
+  };
+
+  const getConnectionIcon = () => {
+    if (syncInProgress) return <SyncIcon className="rotating" />;
+    switch (connectionMode) {
+      case 'websocket': return <RealtimeIcon />;
+      case 'http': return <WifiIcon />;
+      case 'offline': return <WifiOffIcon />;
+      case 'connecting': return <SyncIcon className="rotating" />;
+      default: return <WifiOffIcon />;
+    }
   };
 
   // Render logic
@@ -989,7 +1503,7 @@ function App() {
                   PWA
                 </Typography>
               )}
-              {isMobile && (
+              {connectionMode === 'websocket' && (
                 <Typography 
                   component="span" 
                   variant="caption" 
@@ -1002,13 +1516,13 @@ function App() {
                     fontSize: '0.65rem'
                   }}
                 >
-                  📱 Enhanced Sync
+                  ⚡ Real-time
                 </Typography>
               )}
             </Typography>
             
             <Chip
-              icon={syncInProgress ? <SyncIcon className="rotating" /> : (isOnline ? <WifiIcon /> : <WifiOffIcon />)}
+              icon={getConnectionIcon()}
               label={getConnectionStatusLabel()}
               color={getConnectionStatusColor()}
               size="small"
@@ -1138,8 +1652,10 @@ function App() {
                 onBack={handleBackToList}
                 isMobile={isMobile}
                 currentUser={user}
-                notes={notes}                    // NEW: Array of all notes for bulk sync
-                onNotesUpdated={handleNotesUpdated}  // NEW: Callback when bulk sync updates notes
+                notes={notes}
+                onNotesUpdated={handleNotesUpdated}
+                websocketConnected={websocketConnected}
+                connectionMode={connectionMode}
               />
             </Box>
           )}

@@ -68,6 +68,20 @@ import { syncService, ConflictResolutionStrategies } from '../services/syncServi
 import { useAppLifecycle } from '../hooks/useAppLifecycle';
 import websocketService from '../services/websocketService';
 
+// Helper function outside component
+function formatSaveTime(date) {
+  const now = new Date();
+  const diff = now - date;
+  const seconds = Math.floor(diff / 1000);
+  
+  if (seconds < 60) return 'just now';
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  return date.toLocaleDateString();
+}
+
 const NoteEditor = ({ 
   note, 
   onUpdateNote, 
@@ -76,25 +90,33 @@ const NoteEditor = ({
   currentUser,
   notes = [],                    // Array of all notes for bulk sync
   onNotesUpdated,              // Callback when bulk sync updates notes
-  websocketConnected = false,  // NEW: WebSocket connection status from App.js
-  connectionMode = 'http'      // NEW: Connection mode from App.js
+  websocketConnected = false,  // WebSocket connection status from App.js
+  connectionMode = 'http'      // Connection mode from App.js
 }) => {
   // ===== STATE DECLARATIONS =====
+  // Basic note state
   const [title, setTitle] = useState('');
   const [lastSaved, setLastSaved] = useState(null);
   const [saving, setSaving] = useState(false);
   const [hasUnsavedChanges, setHasUnsavedChanges] = useState(false);
-  const [isLocked, setIsLocked] = useState(false);
-  const [lockOwner, setLockOwner] = useState(null);
-  const [lockError, setLockError] = useState('');
-  const [shareDialogOpen, setShareDialogOpen] = useState(false);
   const [isInitializing, setIsInitializing] = useState(false);
+  
+  // UI state
   const [toolbarExpanded, setToolbarExpanded] = useState(() => {
     // Remember user's preference
     const saved = localStorage.getItem('noteEditorToolbarExpanded');
     return saved ? JSON.parse(saved) : false;
-  }); 
-
+  });
+  const [showCollaborationAlert, setShowCollaborationAlert] = useState(true);
+  
+  // Lock management state
+  const [isLocked, setIsLocked] = useState(false);
+  const [lockOwner, setLockOwner] = useState(null);
+  const [lockError, setLockError] = useState('');
+  
+  // Sharing state
+  const [shareDialogOpen, setShareDialogOpen] = useState(false);
+  
   // Image upload states
   const [imageUploadDialog, setImageUploadDialog] = useState(false);
   const [imageUploading, setImageUploading] = useState(false);
@@ -102,17 +124,15 @@ const NoteEditor = ({
   const [uploadProgress, setUploadProgress] = useState(0);
   const [dragOver, setDragOver] = useState(false);
   
-  // Enhanced collaboration state with WebSocket
+  // Collaboration state
   const [activeEditors, setActiveEditors] = useState([]);
   const [hasRemoteChanges, setHasRemoteChanges] = useState(false);
   const [lastUpdateTimestamp, setLastUpdateTimestamp] = useState(null);
   const [conflictDialogOpen, setConflictDialogOpen] = useState(false);
   const [pendingRemoteUpdate, setPendingRemoteUpdate] = useState(null);
-  const [showCollaborationAlert, setShowCollaborationAlert] = useState(true);
   const [syncingChanges, setSyncingChanges] = useState(false);
   
-  // NEW: WebSocket states
-//  const [websocketConnected, setWebsocketConnected] = useState(false);
+  // WebSocket states
   const [realtimeEnabled, setRealtimeEnabled] = useState(false);
   const [connectionStatus, setConnectionStatus] = useState('disconnected');
   const [lastRealtimeUpdate, setLastRealtimeUpdate] = useState(null);
@@ -124,20 +144,28 @@ const NoteEditor = ({
   const [appResumeSync, setAppResumeSync] = useState(false);
 
   // ===== REF DECLARATIONS =====
+  // Basic note refs
   const currentNoteId = useRef(null);
   const initialValues = useRef({ title: '', content: '' });
   const saveTimeoutRef = useRef(null);
-  const lockTimeoutRef = useRef(null);
-  const lockExtensionIntervalRef = useRef(null);
   const editorReadyRef = useRef(false);
   const userInteractedRef = useRef(false);
+  const noteTimestampRef = useRef(null);
+  const editorUpdateTimeoutRef = useRef(null);
+  
+  // Lock management refs
+  const lockTimeoutRef = useRef(null);
+  const lockExtensionIntervalRef = useRef(null);
+  
+  // File handling refs
   const fileInputRef = useRef(null);
   const dragCounterRef = useRef(0);
+  
+  // Sync refs
   const lastLocalUpdateRef = useRef(null);
   const applyingRemoteChangesRef = useRef(false);
-  const noteTimestampRef = useRef(null);
   
-  // NEW: WebSocket refs
+  // WebSocket refs
   const websocketInitializedRef = useRef(false);
   const realtimeUpdateTimeoutRef = useRef(null);
   const heartbeatIntervalRef = useRef(null);
@@ -153,291 +181,60 @@ const NoteEditor = ({
   const lastBulkSyncTimeRef = useRef(null);
 
   // ===== WEBSOCKET INTEGRATION =====
-  
-  // Use WebSocket connection status from parent App.js
   const isWebSocketActive = websocketConnected && connectionMode === 'websocket';
   
   // Initialize WebSocket connection (only if not already handled by App.js)
   const initializeWebSocket = useCallback(async () => {
     // App.js handles WebSocket initialization, so we just connect to existing service
     if (!websocketService.shouldUseWebSocket() && websocketConnected) {
-      console.log('⚠️ WebSocket should be active but service not ready');
+      console.log('âš ï¸ WebSocket should be active but service not ready');
       return;
     }
 
     if (isWebSocketActive) {
-      console.log('✅ WebSocket active via App.js');
-     // setWebsocketConnected(true);
+      console.log('âœ… WebSocket active via App.js');
       setConnectionStatus('connected');
       
       // Stop any legacy polling since WebSocket is active
       stopLegacyPolling();
     } else {
-      console.log('📡 WebSocket not active, using HTTP fallback');
-      //setWebsocketConnected(false);
-      setConnectionStatus('http-fallback');
+      console.log('ðŸ"¡ WebSocket not active, using HTTP fallback');
+      setConnectionStatus(connectionMode === 'offline' ? 'disconnected' : 'http-fallback');
     }
   }, [isWebSocketActive, websocketConnected]);
 
   // Setup WebSocket event listeners
   const setupWebSocketListeners = useCallback(() => {
     if (!websocketService || !isWebSocketActive) return;
-
+    
     // Note: App.js handles most WebSocket events, we just handle note-specific ones
-
     websocketService.on('note-updated', (data) => {
       // Only handle if this is for our current note
-      if (data.noteId === currentNoteId.current && data.editor?.id !== currentUser?.id) {
-        console.log('📝 Real-time update for current note:', data);
-        handleRealtimeNoteUpdate(data);
+      if (data.noteId === currentNoteId.current) {
+        // Only process updates from different client instances
+        // This allows syncing between different windows/tabs of the same user
+        if (data.clientId !== websocketService.getClientId()) {
+          console.log('ðŸ"„ Real-time update from client:', data.clientId);
+          handleRealtimeNoteUpdate(data);
+        }
       }
     });
 
     websocketService.on('presence-changed', (data) => {
       if (data.noteId === currentNoteId.current) {
-        console.log('👥 Presence changed for current note:', data);
+        console.log('ðŸ'¥ Presence changed for current note:', data);
         setActiveEditors(data.activeEditors || []);
       }
     });
 
     websocketService.on('note-joined', (data) => {
       if (data.noteId === currentNoteId.current) {
-        console.log('✅ Joined note collaboration via WebSocket:', data.noteId);
+        console.log('âœ… Joined note collaboration via WebSocket:', data.noteId);
         setRealtimeEnabled(true);
         setActiveEditors(data.activeEditors || []);
       }
     });
-
   }, [isWebSocketActive, currentUser?.id]);
-
-  // Handle real-time note updates from WebSocket
-  const handleRealtimeNoteUpdate = useCallback((data) => {
-    if (!data || !data.updates || !isWebSocketActive) return;
-    
-    console.log('📝 Processing real-time update:', {
-      noteId: data.noteId,
-      editor: data.editor?.name,
-      hasTitle: !!data.updates.title,
-      hasContent: !!data.updates.content,
-      timestamp: data.timestamp
-    });
-    
-    // Check if this is for the current note
-    if (data.noteId !== currentNoteId.current) {
-      console.log('⭐ Update for different note, ignoring');
-      return;
-    }
-    
-    // Prevent conflicts during local edits
-    const timeSinceLocalUpdate = lastLocalUpdateRef.current ? Date.now() - lastLocalUpdateRef.current : Infinity;
-    if (timeSinceLocalUpdate < 2000) { // 2 seconds
-      console.log('⏰ Recent local update, deferring real-time update');
-      
-      // Defer the update
-      if (realtimeUpdateTimeoutRef.current) {
-        clearTimeout(realtimeUpdateTimeoutRef.current);
-      }
-      
-      realtimeUpdateTimeoutRef.current = setTimeout(() => {
-        handleRealtimeNoteUpdate(data);
-      }, 3000);
-      return;
-    }
-    
-    // Check for local changes before applying
-    const hasLocalChanges = checkForChanges();
-    
-    if (hasLocalChanges) {
-      console.log('⚠️ Local changes detected, showing conflict dialog');
-      setPendingRemoteUpdate({
-        content: data.updates.content,
-        title: data.updates.title,
-        updatedAt: data.timestamp,
-        lastEditor: data.editor
-      });
-      setConflictDialogOpen(true);
-    } else {
-      console.log('✅ No local changes, applying real-time update');
-      applyRemoteChanges({
-        content: data.updates.content,
-        title: data.updates.title,
-        updatedAt: data.timestamp,
-        strategy: 'replace'
-      });
-      
-      setHasRemoteChanges(true);
-      setTimeout(() => setHasRemoteChanges(false), 2000);
-    }
-    
-  }, [isWebSocketActive]);
-
-  // Send real-time note update via WebSocket
-  const sendRealtimeUpdate = useCallback((updates) => {
-    if (!isWebSocketActive || !currentNoteId.current) {
-      return false;
-    }
-    
-    console.log('📡 Sending real-time update via WebSocket:', updates);
-    
-    return websocketService.sendNoteUpdate(currentNoteId.current, updates);
-  }, [isWebSocketActive]);
-
-  // Start legacy HTTP polling (fallback only)
-  const startLegacyPolling = useCallback(() => {
-    // NEVER start HTTP polling if WebSocket is active
-    if (isWebSocketActive) {
-      console.log('⚠️ Skipping HTTP polling - WebSocket is active');
-      return;
-    }
-
-    if (!note?.id || !(note.shared || note.hasBeenShared)) {
-      return;
-    }
-    
-    console.log('🔄 Starting legacy HTTP polling (WebSocket unavailable)');
-    
-    // Reduced from 45 seconds to 10 seconds for better responsiveness when WebSocket unavailable
-    sharedNotePollIntervalRef.current = setInterval(() => {
-      // Double-check WebSocket isn't active
-      if (isWebSocketActive) {
-        console.log('⚠️ WebSocket became active, stopping HTTP polling');
-        stopLegacyPolling();
-        return;
-      }
-      
-      console.log('⏰ Legacy HTTP polling interval triggered');
-      checkForUpdates();
-      
-      setTimeout(() => {
-        checkActiveEditors();
-      }, 2000);
-    }, 10000); // 10 seconds for HTTP fallback
-    
-  }, [note?.id, note?.shared, note?.hasBeenShared, isWebSocketActive]);
-
-  // Stop legacy HTTP polling
-  const stopLegacyPolling = useCallback(() => {
-    if (sharedNotePollIntervalRef.current) {
-      console.log('🛑 Stopping legacy HTTP polling');
-      clearInterval(sharedNotePollIntervalRef.current);
-      sharedNotePollIntervalRef.current = null;
-    }
-    
-    if (pollIntervalRef.current) {
-      clearInterval(pollIntervalRef.current);
-      pollIntervalRef.current = null;
-    }
-    
-    collaborationActiveRef.current = false;
-  }, []);
-
-  // ===== APP LIFECYCLE INTEGRATION =====
-  const handleAppResume = useCallback(async () => {
-    console.log('📱 App resumed - checking WebSocket and triggering sync');
-    
-    // Reconnect WebSocket if needed
-    if (!websocketService.shouldUseWebSocket()) {
-      console.log('🔌 Reconnecting WebSocket after app resume');
-      await initializeWebSocket();
-    }
-    
-    // IMMEDIATE: Always check current note for updates when app resumes
-    if (note?.id && (note.shared || note.hasBeenShared)) {
-      console.log('⚡ Checking current shared note for updates immediately');
-      setTimeout(() => {
-        if (websocketService.shouldUseWebSocket()) {
-          // Use WebSocket for real-time check
-          websocketService.sendHeartbeat(note.id);
-        } else {
-          // Fallback to HTTP
-          checkForUpdates();
-        }
-      }, 500);
-    }
-    
-    if (!currentUser || !notes || notes.length === 0) {
-      console.log('⭐ Skipping bulk sync - no user or notes');
-      return;
-    }
-    
-    setAppResumeSync(true);
-    setBulkSyncInProgress(true);
-    
-    try {
-      console.log(`🔄 Starting bulk sync for ${notes.length} notes after app resume`);
-      
-      // Use WebSocket for bulk sync if available
-      if (websocketService.shouldUseWebSocket()) {
-        const noteTimestamps = {};
-        notes.forEach(note => {
-          if (note.updatedAt) {
-            noteTimestamps[note.id] = note.updatedAt;
-          }
-        });
-        
-        websocketService.requestBulkSync(noteTimestamps);
-        
-        // Also run HTTP-based sync as backup
-        setTimeout(async () => {
-          const results = await syncService.syncAllNotes(notes, currentUser);
-          handleBulkSyncResults(results);
-        }, 2000);
-        
-      } else {
-        // HTTP-only bulk sync
-        const results = await syncService.syncAllNotes(notes, currentUser);
-        handleBulkSyncResults(results);
-      }
-      
-    } catch (error) {
-      console.error('❌ Bulk sync failed:', error);
-    } finally {
-      setBulkSyncInProgress(false);
-      setAppResumeSync(false);
-    }
-  }, [currentUser, notes, onNotesUpdated, note?.id, note?.shared, note?.hasBeenShared, initializeWebSocket]);
-
-  const handleBulkSyncResults = useCallback((results) => {
-    console.log('✅ Bulk sync complete:', {
-      updated: results.updatedNotes.length,
-      conflicts: results.conflicts.length,
-      errors: results.errors.length
-    });
-    
-    setBulkSyncResults(results);
-    setLastBulkSync(new Date());
-    lastBulkSyncTimeRef.current = Date.now();
-    
-    // Notify parent component of updates
-    if (results.updatedNotes.length > 0 && onNotesUpdated) {
-      console.log('🔥 Notifying App.js of bulk sync updates');
-      onNotesUpdated(results.updatedNotes);
-    }
-    
-    // Handle conflicts if any
-    if (results.conflicts.length > 0) {
-      console.log('⚠️ Conflicts detected during bulk sync:', results.conflicts.length);
-      results.conflicts.forEach(conflict => {
-        console.log('⚠️ Conflict in note:', conflict.note.id, conflict.note.title);
-      });
-    }
-    
-    // Clear results after a delay
-    setTimeout(() => {
-      setBulkSyncResults(null);
-    }, 5000);
-  }, [onNotesUpdated]);
-
-  const handleAppBackground = useCallback(() => {
-    console.log('📱 App backgrounded - maintaining WebSocket connection');
-    // Keep WebSocket connected but reduce activity
-    
-    // Stop high-frequency polling
-    stopLegacyPolling();
-  }, [stopLegacyPolling]);
-
-  // Use the app lifecycle hook
-  useAppLifecycle(handleAppResume, handleAppBackground);
 
   // ===== EDITOR SETUP =====
   const editor = useEditor({
@@ -480,7 +277,7 @@ const NoteEditor = ({
     editable: true,
     onUpdate: ({ editor }) => {
       if (!isInitializing && editorReadyRef.current && !applyingRemoteChangesRef.current) {
-        console.log('👤 User interaction detected (not remote update)');
+        console.log('ðŸ'¤ User interaction detected (not remote update)');
         userInteractedRef.current = true;
         
         // Mark note as having pending changes
@@ -493,9 +290,8 @@ const NoteEditor = ({
           const content = editor.getHTML();
           sendRealtimeUpdate({ content });
         }
-        
       } else if (applyingRemoteChangesRef.current) {
-        console.log('🔄 Ignoring programmatic content update (remote changes)');
+        console.log('ðŸ"„ Ignoring programmatic content update (remote changes)');
       }
     },
     editorProps: {
@@ -516,72 +312,10 @@ const NoteEditor = ({
   });
 
   // ===== UTILITY FUNCTIONS =====
-  const toggleToolbar = useCallback(() => {
-    const newState = !toolbarExpanded;
-    setToolbarExpanded(newState);
-    localStorage.setItem('noteEditorToolbarExpanded', JSON.stringify(newState));
-  }, [toolbarExpanded]);
-
   const getCurrentContent = useCallback(() => {
     if (!editor) return '';
     return editor.getHTML();
   }, [editor]);
-
-  const handleUserInteraction = useCallback(() => {
-    if (!isInitializing && editorReadyRef.current && !applyingRemoteChangesRef.current) {
-      const wasInteracted = userInteractedRef.current;
-      userInteractedRef.current = true;
-      
-      console.log('👤 User interaction confirmed - enabling change detection', {
-        wasAlreadyInteracted: wasInteracted,
-        isInitializing,
-        editorReady: editorReadyRef.current,
-        applyingRemote: applyingRemoteChangesRef.current
-      });
-      
-      // Mark note as having pending changes
-      if (note?.id) {
-        syncService.markNotePending(note.id);
-      }
-    } else {
-      console.log('⏸️ User interaction ignored:', {
-        isInitializing,
-        editorReady: editorReadyRef.current,
-        applyingRemote: applyingRemoteChangesRef.current,
-        reason: isInitializing ? 'initializing' : !editorReadyRef.current ? 'editor not ready' : 'applying remote changes'
-      });
-    }
-  }, [isInitializing, note?.id]);
-
-  const handleTitleChange = useCallback((e) => {
-    const newTitle = e.target.value;
-    console.log('📝 Title changing:', {
-      from: title,
-      to: newTitle,
-      isInitializing,
-      editorReady: editorReadyRef.current
-    });
-    
-    setTitle(newTitle);
-    handleUserInteraction();
-    
-    // Send real-time title update if WebSocket available
-    if (isWebSocketActive && currentNoteId.current && !applyingRemoteChangesRef.current) {
-      sendRealtimeUpdate({ title: newTitle });
-    }
-  }, [handleUserInteraction, title, isInitializing, sendRealtimeUpdate]);
-
-  const handleTitleFocus = useCallback((e) => {
-    console.log('📝 Title field focused:', {
-      currentTitle: title,
-      shouldClear: title === 'Untitled'
-    });
-    
-    if (title === 'Untitled') {
-      setTitle('');
-      handleUserInteraction();
-    }
-  }, [title, handleUserInteraction]);
 
   const checkForChanges = useCallback(() => {
     if (!note || !editorReadyRef.current || isInitializing || !userInteractedRef.current || !editor) {
@@ -589,7 +323,7 @@ const NoteEditor = ({
     }
 
     if (applyingRemoteChangesRef.current) {
-      console.log('🔄 Skipping change detection - applying remote changes');
+      console.log('ðŸ"„ Skipping change detection - applying remote changes');
       return false;
     }
 
@@ -612,7 +346,7 @@ const NoteEditor = ({
     const hasChanges = realTitleChanged || contentChanged;
     
     if (hasChanges) {
-      console.log('🔍 Local changes detected:', {
+      console.log('ðŸ" Local changes detected:', {
         titleChanged: realTitleChanged,
         contentChanged,
         isLikelyTitleTimingIssue,
@@ -628,7 +362,7 @@ const NoteEditor = ({
     } else {
       // Only log occasionally to avoid spam
       if (Math.random() < 0.01) { // 1% chance
-        console.log('✅ No local changes detected:', {
+        console.log('âœ… No local changes detected:', {
           titlesSame: currentTitle === initialTitle,
           contentsSame: currentContent === initialContent,
           userInteracted: userInteractedRef.current,
@@ -642,9 +376,42 @@ const NoteEditor = ({
     return hasChanges;
   }, [note, title, isInitializing, getCurrentContent, editor]);
 
-  // Enhanced applyRemoteChanges with conflict resolution
+  const toggleToolbar = useCallback(() => {
+    const newState = !toolbarExpanded;
+    setToolbarExpanded(newState);
+    localStorage.setItem('noteEditorToolbarExpanded', JSON.stringify(newState));
+  }, [toolbarExpanded]);
+
+  const handleUserInteraction = useCallback(() => {
+    if (!isInitializing && editorReadyRef.current && !applyingRemoteChangesRef.current) {
+      const wasInteracted = userInteractedRef.current;
+      userInteractedRef.current = true;
+      
+      console.log('ðŸ'¤ User interaction confirmed - enabling change detection', {
+        wasAlreadyInteracted: wasInteracted,
+        isInitializing,
+        editorReady: editorReadyRef.current,
+        applyingRemote: applyingRemoteChangesRef.current
+      });
+      
+      // Mark note as having pending changes
+      if (note?.id) {
+        syncService.markNotePending(note.id);
+      }
+    } else {
+      console.log('â¸ï¸ User interaction ignored:', {
+        isInitializing,
+        editorReady: editorReadyRef.current,
+        applyingRemote: applyingRemoteChangesRef.current,
+        reason: isInitializing ? 'initializing' : !editorReadyRef.current ? 'editor not ready' : 'applying remote changes'
+      });
+    }
+  }, [isInitializing, note?.id]);
+
+  // ===== COLLABORATIVE EDITING FUNCTIONS =====
+  // Apply remote changes to the editor
   const applyRemoteChanges = useCallback(({ content, title: remoteTitle, updatedAt, strategy = 'replace' }) => {
-    console.log('🔄 Applying remote changes with strategy:', strategy, {
+    console.log('ðŸ"„ Applying remote changes with strategy:', strategy, {
       hasContent: !!content,
       hasTitle: !!remoteTitle,
       updatedAt,
@@ -666,7 +433,7 @@ const NoteEditor = ({
           content, 
           { remoteTimestamp: updatedAt }
         );
-        console.log('🔀 Applied intelligent merge strategy');
+        console.log('ðŸ"€ Applied intelligent merge strategy');
       }
       
       // Update initial values FIRST with the new values we're about to apply
@@ -675,22 +442,22 @@ const NoteEditor = ({
         content: finalContent || getCurrentContent() 
       };
       initialValues.current = newInitialValues;
-      console.log('📝 Updated initial values before applying changes:', {
+      console.log('ðŸ" Updated initial values before applying changes:', {
         title: newInitialValues.title,
         contentLength: newInitialValues.content?.length || 0
       });
       
       // IMPORTANT: Reset user interaction flag BEFORE updating content
       userInteractedRef.current = false;
-      console.log('🔄 Reset user interaction flag - content now in sync');
+      console.log('ðŸ"„ Reset user interaction flag - content now in sync');
       
       if (finalContent && finalContent !== getCurrentContent()) {
-        console.log('📝 Updating editor content');
+        console.log('ðŸ" Updating editor content');
         editor?.commands.setContent(finalContent);
       }
       
       if (finalTitle && finalTitle !== title) {
-        console.log('📝 Updating title:', finalTitle);
+        console.log('ðŸ" Updating title:', finalTitle);
         setTitle(finalTitle);
       }
       
@@ -710,68 +477,157 @@ const NoteEditor = ({
       // Longer delay to ensure React state updates complete
       setTimeout(() => {
         applyingRemoteChangesRef.current = false;
-        console.log('🔄 Remote changes application complete');
+        console.log('ðŸ"„ Remote changes application complete');
       }, 200);
     }
     
   }, [editor, getCurrentContent, title, note?.id]);
 
-  const saveNote = useCallback(async (noteId, updates) => {
-    if (!noteId) return;
+  // Send real-time note update via WebSocket
+  const sendRealtimeUpdate = useCallback((updates) => {
+    if (!isWebSocketActive || !currentNoteId.current) {
+      return false;
+    }
     
-    setSaving(true);
-    lastLocalUpdateRef.current = Date.now();
+    // Clear any existing timeout
+    if (editorUpdateTimeoutRef.current) {
+      clearTimeout(editorUpdateTimeoutRef.current);
+    }
     
-    try {
-      const response = await onUpdateNote(noteId, updates);
-      const savedNote = response?.data || response;
+    // Debounce updates to avoid overwhelming the connection
+    editorUpdateTimeoutRef.current = setTimeout(() => {
+      console.log('ðŸ"„ Sending real-time update via WebSocket:', updates);
+      websocketService.sendNoteUpdate(currentNoteId.current, updates);
       
-      setLastSaved(new Date());
+      // Remember this update came from this client
+      lastLocalUpdateRef.current = Date.now();
+    }, 300); // 300ms debounce
+    
+    return true;
+  }, [isWebSocketActive]);
+
+  // Handle real-time note updates from WebSocket
+  const handleRealtimeNoteUpdate = useCallback((data) => {
+    if (!data || !data.updates || !isWebSocketActive) return;
+    
+    console.log('ðŸ" Processing real-time update:', {
+      noteId: data.noteId,
+      editor: data.editor?.name,
+      hasTitle: !!data.updates.title,
+      hasContent: !!data.updates.content,
+      timestamp: data.timestamp,
+      fromSameUser: data.editor?.id === currentUser?.id,
+      clientId: data.clientId
+    });
+    
+    // Check if this is for the current note
+    if (data.noteId !== currentNoteId.current) {
+      console.log('âŒ Update for different note, ignoring');
+      return;
+    }
+    
+    // Prevent conflicts during local edits
+    const timeSinceLocalUpdate = lastLocalUpdateRef.current ? Date.now() - lastLocalUpdateRef.current : Infinity;
+    if (timeSinceLocalUpdate < 2000) { // 2 seconds
+      console.log('â° Recent local update, deferring real-time update');
+      
+      // Defer the update
+      if (realtimeUpdateTimeoutRef.current) {
+        clearTimeout(realtimeUpdateTimeoutRef.current);
+      }
+      
+      realtimeUpdateTimeoutRef.current = setTimeout(() => {
+        handleRealtimeNoteUpdate(data);
+      }, 3000);
+      return;
+    }
+    
+    // Check for local changes before applying
+    const hasLocalChanges = checkForChanges();
+    
+    if (hasLocalChanges) {
+      console.log('âš ï¸ Local changes detected, showing conflict dialog');
+      setPendingRemoteUpdate({
+        content: data.updates.content,
+        title: data.updates.title,
+        updatedAt: data.timestamp,
+        lastEditor: data.editor
+      });
+      setConflictDialogOpen(true);
+    } else {
+      console.log('âœ… No local changes, applying real-time update');
+      applyRemoteChanges({
+        content: data.updates.content,
+        title: data.updates.title,
+        updatedAt: data.timestamp,
+        strategy: 'replace'
+      });
+      
+      setHasRemoteChanges(true);
+      setTimeout(() => setHasRemoteChanges(false), 2000);
+    }
+  }, [isWebSocketActive, currentUser?.id, checkForChanges, applyRemoteChanges]);
+
+  // Enhanced conflict resolution with strategies
+  const handleConflictResolution = useCallback(async (resolution) => {
+    console.log('ðŸ"§ Resolving conflict with strategy:', resolution);
+    
+    if (!pendingRemoteUpdate) return;
+    
+    const { content: remoteContent, title: remoteTitle, updatedAt } = pendingRemoteUpdate;
+    
+    if (resolution === 'accept') {
+      console.log('âœ… Accepting remote changes');
+      applyRemoteChanges(pendingRemoteUpdate);
       setHasUnsavedChanges(false);
       
-      if (savedNote?.updatedAt) {
-        const newTimestamp = savedNote.updatedAt;
-        console.log('💾 Save successful, updating timestamps:', {
-          oldTimestamp: noteTimestampRef.current,
-          newTimestamp,
-          noteId
-        });
-        
-        noteTimestampRef.current = newTimestamp;
-        setLastUpdateTimestamp(newTimestamp);
-      }
+    } else if (resolution === 'reject') {
+      console.log('âŒ Rejecting remote changes');
+      setLastUpdateTimestamp(updatedAt);
       
-      initialValues.current = { 
-        title: updates.title !== undefined ? updates.title : title,
-        content: updates.content !== undefined ? updates.content : getCurrentContent()
-      };
+    } else if (resolution === 'merge') {
+      console.log('ðŸ"€ Merging changes');
+      const currentContent = getCurrentContent();
+      const currentTitle = title;
       
-      // Clear pending status after successful save
-      syncService.clearNotePending(noteId);
+      // Use intelligent merge strategy
+      const finalContent = ConflictResolutionStrategies.intelligentMerge(
+        currentContent,
+        remoteContent,
+        { remoteTimestamp: updatedAt }
+      );
       
-      console.log('💾 Save successful, updated initial values');
+      const hasLocalTitleChanges = currentTitle !== initialValues.current.title;
+      const finalTitle = hasLocalTitleChanges ? currentTitle : remoteTitle;
       
-      // Update initial values after save to prevent false conflict detection
+      setTitle(finalTitle);
+      editor?.commands.setContent(finalContent);
+      setLastUpdateTimestamp(updatedAt);
+      
       setTimeout(() => {
-        initialValues.current = { 
-          title: updates.title !== undefined ? updates.title : title,
-          content: updates.content !== undefined ? updates.content : getCurrentContent()
-        };
-        console.log('📝 Updated initial values after save delay');
-      }, 100);
+        saveNote(note.id, { title: finalTitle, content: finalContent });
+      }, 500);
       
-    } catch (error) {
-      console.error('Auto-save failed:', error);
-      if (error.response?.status === 423) {
-        setLockError('Note is locked by another user');
-      } else if (error.response?.status === 403) {
-        setLockError('You do not have permission to edit this note');
-      }
-    } finally {
-      setSaving(false);
+    } else if (resolution === 'smart-merge') {
+      console.log('ðŸ§  Smart merging changes');
+      // Use smart merge for lists
+      const currentContent = getCurrentContent();
+      const finalContent = ConflictResolutionStrategies.smartMergeList(currentContent, remoteContent);
+      
+      editor?.commands.setContent(finalContent);
+      setLastUpdateTimestamp(updatedAt);
+      
+      setTimeout(() => {
+        saveNote(note.id, { content: finalContent });
+      }, 500);
     }
-  }, [onUpdateNote, title, getCurrentContent]);
+    
+    setConflictDialogOpen(false);
+    setPendingRemoteUpdate(null);
+    
+  }, [pendingRemoteUpdate, applyRemoteChanges, getCurrentContent, title, editor, saveNote, note?.id]);
 
+  // ===== SYNC FUNCTIONS =====
   // Legacy HTTP-based functions (fallback when WebSocket unavailable)
   const checkForUpdates = useCallback(async () => {
     const effectiveTimestamp = lastUpdateTimestamp || noteTimestampRef.current;
@@ -787,7 +643,7 @@ const NoteEditor = ({
       
       const timeSinceLocalUpdate = lastLocalUpdateRef.current ? Date.now() - lastLocalUpdateRef.current : Infinity;
       if (lastEditor?.id === currentUser?.id && timeSinceLocalUpdate < 5000) {
-        console.log('⭐ Skipping own update (within 5 seconds)');
+        console.log('â­ Skipping own update (within 5 seconds)');
         noteTimestampRef.current = updatedAt;
         setLastUpdateTimestamp(updatedAt);
         return;
@@ -804,7 +660,7 @@ const NoteEditor = ({
         return;
       }
       
-      console.log('🔄 Remote changes detected:', { 
+      console.log('ðŸ"„ Remote changes detected:', { 
         updatedAt, 
         lastEditor: lastEditor?.name,
         timeSinceLocal: timeSinceLocalUpdate + 'ms'
@@ -813,20 +669,20 @@ const NoteEditor = ({
       const hasLocalChanges = checkForChanges();
       
       if (hasLocalChanges && !applyingRemoteChangesRef.current) {
-        console.log('⚠️ Conflict detected - showing resolution dialog');
+        console.log('âš ï¸ Conflict detected - showing resolution dialog');
         setPendingRemoteUpdate({ content, title: remoteTitle, updatedAt, lastEditor });
         setConflictDialogOpen(true);
       } else {
-        console.log('✅ Applying remote changes directly (no conflict)');
+        console.log('âœ… Applying remote changes directly (no conflict)');
         applyRemoteChanges({ content, title: remoteTitle, updatedAt });
       }
       
     } catch (error) {
       if (error.response?.status === 429) {
-        console.log('⏸️ Rate limited - will retry later');
+        console.log('â¸ï¸ Rate limited - will retry later');
         return;
       }
-      console.error('❌ Failed to check for updates:', error);
+      console.error('âŒ Failed to check for updates:', error);
     } finally {
       setSyncingChanges(false);
     }
@@ -846,12 +702,61 @@ const NoteEditor = ({
       
     } catch (error) {
       if (error.response?.status === 500) {
-        console.log('⚠️ Presence endpoint not available (500) - continuing without presence detection');
+        console.log('âš ï¸ Presence endpoint not available (500) - continuing without presence detection');
       } else if (error.response?.status !== 429) {
-        console.error('❌ Failed to check active editors:', error);
+        console.error('âŒ Failed to check active editors:', error);
       }
     }
   }, [note?.id, currentUser?.id]);
+
+  // Start legacy HTTP polling (fallback only)
+  const startLegacyPolling = useCallback(() => {
+    // NEVER start HTTP polling if WebSocket is active
+    if (isWebSocketActive) {
+      console.log('âš ï¸ Skipping HTTP polling - WebSocket is active');
+      return;
+    }
+
+    if (!note?.id || !(note.shared || note.hasBeenShared)) {
+      return;
+    }
+    
+    console.log('ðŸ"„ Starting legacy HTTP polling (WebSocket unavailable)');
+    
+    // Reduced from 45 seconds to 10 seconds for better responsiveness when WebSocket unavailable
+    sharedNotePollIntervalRef.current = setInterval(() => {
+      // Double-check WebSocket isn't active
+      if (isWebSocketActive) {
+        console.log('âš ï¸ WebSocket became active, stopping HTTP polling');
+        stopLegacyPolling();
+        return;
+      }
+      
+      console.log('â° Legacy HTTP polling interval triggered');
+      checkForUpdates();
+      
+      setTimeout(() => {
+        checkActiveEditors();
+      }, 2000);
+    }, 10000); // 10 seconds for HTTP fallback
+    
+  }, [note?.id, note?.shared, note?.hasBeenShared, isWebSocketActive]);
+
+  // Stop legacy HTTP polling
+  const stopLegacyPolling = useCallback(() => {
+    if (sharedNotePollIntervalRef.current) {
+      console.log('ðŸ›' Stopping legacy HTTP polling');
+      clearInterval(sharedNotePollIntervalRef.current);
+      sharedNotePollIntervalRef.current = null;
+    }
+    
+    if (pollIntervalRef.current) {
+      clearInterval(pollIntervalRef.current);
+      pollIntervalRef.current = null;
+    }
+    
+    collaborationActiveRef.current = false;
+  }, []);
 
   // Manual bulk sync trigger
   const handleManualBulkSync = useCallback(async () => {
@@ -860,7 +765,7 @@ const NoteEditor = ({
     }
     
     setBulkSyncInProgress(true);
-    console.log('🔄 Manual bulk sync triggered');
+    console.log('ðŸ"„ Manual bulk sync triggered');
     
     try {
       // Use WebSocket for bulk sync if available
@@ -887,13 +792,177 @@ const NoteEditor = ({
       }
       
     } catch (error) {
-      console.error('❌ Manual bulk sync failed:', error);
+      console.error('âŒ Manual bulk sync failed:', error);
     } finally {
       setBulkSyncInProgress(false);
     }
   }, [bulkSyncInProgress, currentUser, notes, handleBulkSyncResults]);
 
-  // ===== OTHER FUNCTIONS (keeping existing implementations) =====
+  const handleBulkSyncResults = useCallback((results) => {
+    console.log('âœ… Bulk sync complete:', {
+      updated: results.updatedNotes.length,
+      conflicts: results.conflicts.length,
+      errors: results.errors.length
+    });
+    
+    setBulkSyncResults(results);
+    setLastBulkSync(new Date());
+    lastBulkSyncTimeRef.current = Date.now();
+    
+    // Notify parent component of updates
+    if (results.updatedNotes.length > 0 && onNotesUpdated) {
+      console.log('ðŸ"¥ Notifying App.js of bulk sync updates');
+      onNotesUpdated(results.updatedNotes);
+    }
+    
+    // Handle conflicts if any
+    if (results.conflicts.length > 0) {
+      console.log('âš ï¸ Conflicts detected during bulk sync:', results.conflicts.length);
+      results.conflicts.forEach(conflict => {
+        console.log('âš ï¸ Conflict in note:', conflict.note.id, conflict.note.title);
+      });
+    }
+    
+    // Clear results after a delay
+    setTimeout(() => {
+      setBulkSyncResults(null);
+    }, 5000);
+  }, [onNotesUpdated]);
+  
+  // ===== APP LIFECYCLE INTEGRATION =====
+  const handleAppResume = useCallback(async () => {
+    console.log('ðŸ"± App resumed - checking WebSocket and triggering sync');
+    
+    // Reconnect WebSocket if needed
+    if (!websocketService.shouldUseWebSocket()) {
+      console.log('ðŸ"Œ Reconnecting WebSocket after app resume');
+      await initializeWebSocket();
+    }
+    
+    // IMMEDIATE: Always check current note for updates when app resumes
+    if (note?.id && (note.shared || note.hasBeenShared)) {
+      console.log('âš¡ Checking current shared note for updates immediately');
+      setTimeout(() => {
+        if (websocketService.shouldUseWebSocket()) {
+          // Use WebSocket for real-time check
+          websocketService.sendHeartbeat(note.id);
+        } else {
+          // Fallback to HTTP
+          checkForUpdates();
+        }
+      }, 500);
+    }
+    
+    if (!currentUser || !notes || notes.length === 0) {
+      console.log('â­ Skipping bulk sync - no user or notes');
+      return;
+    }
+    
+    setAppResumeSync(true);
+    setBulkSyncInProgress(true);
+    
+    try {
+      console.log(`ðŸ"„ Starting bulk sync for ${notes.length} notes after app resume`);
+      
+      // Use WebSocket for bulk sync if available
+      if (websocketService.shouldUseWebSocket()) {
+        const noteTimestamps = {};
+        notes.forEach(note => {
+          if (note.updatedAt) {
+            noteTimestamps[note.id] = note.updatedAt;
+          }
+        });
+        
+        websocketService.requestBulkSync(noteTimestamps);
+        
+        // Also run HTTP-based sync as backup
+        setTimeout(async () => {
+          const results = await syncService.syncAllNotes(notes, currentUser);
+          handleBulkSyncResults(results);
+        }, 2000);
+        
+      } else {
+        // HTTP-only bulk sync
+        const results = await syncService.syncAllNotes(notes, currentUser);
+        handleBulkSyncResults(results);
+      }
+      
+    } catch (error) {
+      console.error('âŒ Bulk sync failed:', error);
+    } finally {
+      setBulkSyncInProgress(false);
+      setAppResumeSync(false);
+    }
+  }, [currentUser, notes, onNotesUpdated, note?.id, note?.shared, note?.hasBeenShared, initializeWebSocket]);
+
+  const handleAppBackground = useCallback(() => {
+    console.log('ðŸ"± App backgrounded - maintaining WebSocket connection');
+    // Keep WebSocket connected but reduce activity
+    
+    // Stop high-frequency polling
+    stopLegacyPolling();
+  }, [stopLegacyPolling]);
+
+  // Use the app lifecycle hook
+  useAppLifecycle(handleAppResume, handleAppBackground);
+
+  // ===== SAVE FUNCTIONS =====
+  const saveNote = useCallback(async (noteId, updates) => {
+    if (!noteId) return;
+    
+    setSaving(true);
+    lastLocalUpdateRef.current = Date.now();
+    
+    try {
+      const response = await onUpdateNote(noteId, updates);
+      const savedNote = response?.data || response;
+      
+      setLastSaved(new Date());
+      setHasUnsavedChanges(false);
+      
+      if (savedNote?.updatedAt) {
+        const newTimestamp = savedNote.updatedAt;
+        console.log('ðŸ'¾ Save successful, updating timestamps:', {
+          oldTimestamp: noteTimestampRef.current,
+          newTimestamp,
+          noteId
+        });
+        
+        noteTimestampRef.current = newTimestamp;
+        setLastUpdateTimestamp(newTimestamp);
+      }
+      
+      initialValues.current = { 
+        title: updates.title !== undefined ? updates.title : title,
+        content: updates.content !== undefined ? updates.content : getCurrentContent()
+      };
+      
+      // Clear pending status after successful save
+      syncService.clearNotePending(noteId);
+      
+      console.log('ðŸ'¾ Save successful, updated initial values');
+      
+      // Update initial values after save to prevent false conflict detection
+      setTimeout(() => {
+        initialValues.current = { 
+          title: updates.title !== undefined ? updates.title : title,
+          content: updates.content !== undefined ? updates.content : getCurrentContent()
+        };
+        console.log('ðŸ" Updated initial values after save delay');
+      }, 100);
+      
+    } catch (error) {
+      console.error('Auto-save failed:', error);
+      if (error.response?.status === 423) {
+        setLockError('Note is locked by another user');
+      } else if (error.response?.status === 403) {
+        setLockError('You do not have permission to edit this note');
+      }
+    } finally {
+      setSaving(false);
+    }
+  }, [onUpdateNote, title, getCurrentContent]);
+
   const handleManualSave = useCallback(async () => {
     if (!note || !editor) return;
     
@@ -917,66 +986,89 @@ const NoteEditor = ({
     }
   }, [note, title, getCurrentContent, saveNote, editor]);
 
-  // Enhanced conflict resolution with strategies
-  const handleConflictResolution = useCallback(async (resolution) => {
-    console.log('🔧 Resolving conflict with strategy:', resolution);
+  // ===== LOCK MANAGEMENT =====
+  const acquireLock = useCallback(async (noteId) => {
+    if (!noteId) return false;
     
-    if (!pendingRemoteUpdate) return;
-    
-    const { content: remoteContent, title: remoteTitle, updatedAt } = pendingRemoteUpdate;
-    
-    if (resolution === 'accept') {
-      console.log('✅ Accepting remote changes');
-      applyRemoteChanges(pendingRemoteUpdate);
-      setHasUnsavedChanges(false);
+    try {
+      const response = await fetch(`${api.baseURL}/api/notes/${noteId}/lock`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${localStorage.getItem('token')}`,
+          'Content-Type': 'application/json'
+        },
+        credentials: 'include'
+      });
       
-    } else if (resolution === 'reject') {
-      console.log('❌ Rejecting remote changes');
-      setLastUpdateTimestamp(updatedAt);
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}));
+        const errorMsg = errorData.error || 'Failed to acquire lock';
+        
+        if (response.status === 409 || response.status === 423) {
+          setLockError(errorMsg);
+        }
+        setIsLocked(false);
+        return false;
+      }
       
-    } else if (resolution === 'merge') {
-      console.log('🔀 Merging changes');
-      const currentContent = getCurrentContent();
-      const currentTitle = title;
+      setIsLocked(true);
+      setLockError('');
       
-      // Use intelligent merge strategy
-      const finalContent = ConflictResolutionStrategies.intelligentMerge(
-        currentContent,
-        remoteContent,
-        { remoteTimestamp: updatedAt }
-      );
+      lockExtensionIntervalRef.current = setInterval(async () => {
+        try {
+          const extendResponse = await fetch(`${api.baseURL}/api/notes/${noteId}/lock`, {
+            method: 'PUT',
+            headers: {
+              'Authorization': `Bearer ${localStorage.getItem('token')}`,
+              'Content-Type': 'application/json'
+            },
+            credentials: 'include'
+          });
+          
+          if (!extendResponse.ok && (extendResponse.status === 409 || extendResponse.status === 423)) {
+            console.error('Lock conflict during extension');
+            setLockError('Another user is now editing this note');
+            setIsLocked(false);
+            clearInterval(lockExtensionIntervalRef.current);
+          }
+        } catch (error) {
+          console.warn('Lock extension failed:', error.message);
+        }
+      }, 15000);
       
-      const hasLocalTitleChanges = currentTitle !== initialValues.current.title;
-      const finalTitle = hasLocalTitleChanges ? currentTitle : remoteTitle;
-      
-      setTitle(finalTitle);
-      editor?.commands.setContent(finalContent);
-      setLastUpdateTimestamp(updatedAt);
-      
-      setTimeout(() => {
-        saveNote(note.id, { title: finalTitle, content: finalContent });
-      }, 500);
-      
-    } else if (resolution === 'smart-merge') {
-      console.log('🧠 Smart merging changes');
-      // Use smart merge for lists
-      const currentContent = getCurrentContent();
-      const finalContent = ConflictResolutionStrategies.smartMergeList(currentContent, remoteContent);
-      
-      editor?.commands.setContent(finalContent);
-      setLastUpdateTimestamp(updatedAt);
-      
-      setTimeout(() => {
-        saveNote(note.id, { content: finalContent });
-      }, 500);
+      return true;
+    } catch (error) {
+      console.error('Lock acquisition failed:', error);
+      setIsLocked(false);
+      return false;
     }
-    
-    setConflictDialogOpen(false);
-    setPendingRemoteUpdate(null);
-    
-  }, [pendingRemoteUpdate, applyRemoteChanges, getCurrentContent, title, editor, saveNote, note?.id]);
+  }, []);
 
-  // ===== IMAGE UPLOAD FUNCTIONS (keeping existing implementations) =====
+  const releaseLock = useCallback(async (noteId) => {
+    if (!noteId) return;
+    
+    try {
+      await fetch(`${api.baseURL}/api/notes/${noteId}/lock`, {
+        method: 'DELETE',
+        headers: {
+          'Authorization': `Bearer ${localStorage.getItem('token')}`,
+          'Content-Type': 'application/json'
+        },
+        credentials: 'include'
+      });
+    } catch (error) {
+      console.error('Failed to release lock:', error);
+    } finally {
+      setIsLocked(false);
+      setLockError('');
+      if (lockExtensionIntervalRef.current) {
+        clearInterval(lockExtensionIntervalRef.current);
+        lockExtensionIntervalRef.current = null;
+      }
+    }
+  }, []);
+
+  // ===== IMAGE HANDLING =====
   const storeImageOffline = useCallback(async (file) => {
     return new Promise((resolve, reject) => {
       const reader = new FileReader();
@@ -1123,7 +1215,17 @@ const NoteEditor = ({
     }
   }, [handleImageUpload]);
 
-  // ===== DRAG AND DROP HANDLERS (keeping existing implementations) =====
+  const handleFileInputChange = useCallback((event) => {
+    const files = event.target.files;
+    if (files && files.length > 0) {
+      handleMultipleFiles(files);
+      if (fileInputRef.current) {
+        fileInputRef.current.value = '';
+      }
+    }
+  }, [handleMultipleFiles]);
+
+  // ===== DRAG AND DROP HANDLERS =====
   const handleDragEnter = useCallback((e) => {
     e.preventDefault();
     e.stopPropagation();
@@ -1162,17 +1264,37 @@ const NoteEditor = ({
     }
   }, [handleMultipleFiles]);
 
-  const handleFileInputChange = useCallback((event) => {
-    const files = event.target.files;
-    if (files && files.length > 0) {
-      handleMultipleFiles(files);
-      if (fileInputRef.current) {
-        fileInputRef.current.value = '';
-      }
+  // ===== EVENT HANDLERS =====
+  const handleTitleChange = useCallback((e) => {
+    const newTitle = e.target.value;
+    console.log('ðŸ" Title changing:', {
+      from: title,
+      to: newTitle,
+      isInitializing,
+      editorReady: editorReadyRef.current
+    });
+    
+    setTitle(newTitle);
+    handleUserInteraction();
+    
+    // Send real-time title update if WebSocket available
+    if (isWebSocketActive && currentNoteId.current && !applyingRemoteChangesRef.current) {
+      sendRealtimeUpdate({ title: newTitle });
     }
-  }, [handleMultipleFiles]);
+  }, [handleUserInteraction, title, isInitializing, sendRealtimeUpdate]);
 
-  // ===== NAVIGATION HANDLERS =====
+  const handleTitleFocus = useCallback((e) => {
+    console.log('ðŸ" Title field focused:', {
+      currentTitle: title,
+      shouldClear: title === 'Untitled'
+    });
+    
+    if (title === 'Untitled') {
+      setTitle('');
+      handleUserInteraction();
+    }
+  }, [title, handleUserInteraction]);
+
   const handleBack = useCallback(async () => {
     if (saveTimeoutRef.current) {
       clearTimeout(saveTimeoutRef.current);
@@ -1196,7 +1318,7 @@ const NoteEditor = ({
     }
   }, [handleManualSave, note?.id, onBack]);
 
-  // ===== TOOLBAR HANDLERS (keeping existing implementations) =====
+  // ===== TOOLBAR HANDLERS =====
   const handleBold = () => editor?.chain().focus().toggleBold().run();
   const handleItalic = () => editor?.chain().focus().toggleItalic().run();
   const handleUnderline = () => editor?.chain().focus().toggleUnderline().run();
@@ -1221,118 +1343,27 @@ const NoteEditor = ({
     setImageError('');
   };
 
-  // ===== LOCK MANAGEMENT (keeping existing implementations) =====
-  const releaseLock = useCallback(async (noteId) => {
-    if (!noteId) return;
-    
-    try {
-      await fetch(`${api.baseURL}/api/notes/${noteId}/lock`, {
-        method: 'DELETE',
-        headers: {
-          'Authorization': `Bearer ${localStorage.getItem('token')}`,
-          'Content-Type': 'application/json'
-        },
-        credentials: 'include'
-      });
-    } catch (error) {
-      console.error('Failed to release lock:', error);
-    } finally {
-      setIsLocked(false);
-      setLockError('');
-      if (lockExtensionIntervalRef.current) {
-        clearInterval(lockExtensionIntervalRef.current);
-        lockExtensionIntervalRef.current = null;
-      }
-    }
-  }, []);
-
-  const acquireLock = useCallback(async (noteId) => {
-    if (!noteId) return false;
-    
-    try {
-      const response = await fetch(`${api.baseURL}/api/notes/${noteId}/lock`, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${localStorage.getItem('token')}`,
-          'Content-Type': 'application/json'
-        },
-        credentials: 'include'
-      });
-      
-      if (!response.ok) {
-        const errorData = await response.json().catch(() => ({}));
-        const errorMsg = errorData.error || 'Failed to acquire lock';
-        
-        if (response.status === 409 || response.status === 423) {
-          setLockError(errorMsg);
-        }
-        setIsLocked(false);
-        return false;
-      }
-      
-      setIsLocked(true);
-      setLockError('');
-      
-      lockExtensionIntervalRef.current = setInterval(async () => {
-        try {
-          const extendResponse = await fetch(`${api.baseURL}/api/notes/${noteId}/lock`, {
-            method: 'PUT',
-            headers: {
-              'Authorization': `Bearer ${localStorage.getItem('token')}`,
-              'Content-Type': 'application/json'
-            },
-            credentials: 'include'
-          });
-          
-          if (!extendResponse.ok && (extendResponse.status === 409 || extendResponse.status === 423)) {
-            console.error('Lock conflict during extension');
-            setLockError('Another user is now editing this note');
-            setIsLocked(false);
-            clearInterval(lockExtensionIntervalRef.current);
-          }
-        } catch (error) {
-          console.warn('Lock extension failed:', error.message);
-        }
-      }, 15000);
-      
-      return true;
-    } catch (error) {
-      console.error('Lock acquisition failed:', error);
-      setIsLocked(false);
-      return false;
-    }
-  }, []);
-
   // ===== EFFECTS =====
-
   // Initialize WebSocket when connection becomes available
   useEffect(() => {
     if (isWebSocketActive) {
-      console.log('🔌 WebSocket became active, setting up listeners');
+      console.log('ðŸ"Œ WebSocket became active, setting up listeners');
       setupWebSocketListeners();
       setConnectionStatus('connected');
       
       // Stop any HTTP polling
       stopLegacyPolling();
     } else {
-      console.log('📡 WebSocket not active, connection mode:', connectionMode);
+      console.log('ðŸ"¡ WebSocket not active, connection mode:', connectionMode);
       setConnectionStatus(connectionMode === 'offline' ? 'disconnected' : 'http-fallback');
       setRealtimeEnabled(false);
     }
   }, [isWebSocketActive, connectionMode, setupWebSocketListeners, stopLegacyPolling]);
 
-  // Setup app lifecycle integration
-//  useEffect(() => {
-    // This is handled by App.js now, we just need to respond to changes
-//    if (websocketConnected !== isWebSocketActive) {
-//      setWebsocketConnected(isWebSocketActive);
-//    }
-//  }, [isWebSocketActive, websocketConnected]);
-
   // Reset state when note changes
   useEffect(() => {
     if (note && note.id !== currentNoteId.current) {
-      console.log('📝 Loading new note:', {
+      console.log('ðŸ" Loading new note:', {
         noteId: note.id,
         title: note.title || 'Untitled',
         shared: note.shared,
@@ -1341,7 +1372,7 @@ const NoteEditor = ({
       
       // Cleanup previous note
       if (currentNoteId.current) {
-        console.log('🧹 Cleaning up previous note:', currentNoteId.current);
+        console.log('ðŸ§¹ Cleaning up previous note:', currentNoteId.current);
         releaseLock(currentNoteId.current);
         
         // Leave WebSocket room for previous note
@@ -1414,18 +1445,20 @@ const NoteEditor = ({
                 // Initialize collaboration after state is stable
                 setTimeout(async () => {
                   if (currentUser) {
-                    console.log('🤝 Initializing collaboration for note:', note.id);
+                    console.log('ðŸ¤ Initializing collaboration for note:', note.id);
                     
-                    const isCollaborativeNote = note.shared || note.hasBeenShared;
+                    // IMPORTANT CHANGE: Always treat notes as collaborative, not just shared ones
+                    // const isCollaborativeNote = note.shared || note.hasBeenShared;
+                    const isCollaborativeNote = true; // Always enable real-time for all notes
                     
                     if (isCollaborativeNote) {
                       // Try WebSocket first if available
                       if (isWebSocketActive) {
-                        console.log('🔌 Joining note via WebSocket');
+                        console.log('ðŸ"Œ Joining note via WebSocket');
                         await websocketService.joinNote(note.id);
                         setRealtimeEnabled(true);
                       } else {
-                        console.log('📡 WebSocket not available, using HTTP fallback');
+                        console.log('ðŸ"¡ WebSocket not available, using HTTP fallback');
                         // Fallback to HTTP-based presence
                         try {
                           await api.post(`/api/notes/${note.id}/presence`, {
@@ -1435,17 +1468,17 @@ const NoteEditor = ({
                               avatar: currentUser.avatar
                             }
                           });
-                          console.log('✅ HTTP presence registration successful');
+                          console.log('âœ… HTTP presence registration successful');
                         } catch (error) {
                           console.warn('HTTP presence registration failed:', error);
                         }
                         
-                        // Start HTTP polling for shared notes when WebSocket unavailable
+                        // Start HTTP polling for all notes when WebSocket unavailable
                         startLegacyPolling();
                       }
                       
-                      // Immediate sync check for shared notes
-                      console.log('⚡ Triggering immediate sync for shared note');
+                      // Immediate sync check for all notes
+                      console.log('âš¡ Triggering immediate sync for note');
                       setTimeout(() => {
                         if (isWebSocketActive) {
                           websocketService.sendHeartbeat(note.id);
@@ -1463,7 +1496,7 @@ const NoteEditor = ({
       }
       
     } else if (!note) {
-      console.log('🗑️ No note selected, cleaning up');
+      console.log('ðŸ—'ï¸ No note selected, cleaning up');
       // Cleanup when no note
       if (currentNoteId.current) {
         releaseLock(currentNoteId.current);
@@ -1530,7 +1563,7 @@ const NoteEditor = ({
       presenceIntervalRef.current = setInterval(async () => {
         // Double-check WebSocket isn't active
         if (isWebSocketActive) {
-          console.log('⚠️ WebSocket became active, stopping HTTP presence checks');
+          console.log('âš ï¸ WebSocket became active, stopping HTTP presence checks');
           clearInterval(presenceIntervalRef.current);
           return;
         }
@@ -1539,7 +1572,7 @@ const NoteEditor = ({
           await checkActiveEditors();
         } catch (error) {
           if (error.response?.status !== 429 && error.response?.status !== 500) {
-            console.error('❌ Presence check failed:', error);
+            console.error('âŒ Presence check failed:', error);
           }
         }
       }, checkInterval);
@@ -1575,7 +1608,7 @@ const NoteEditor = ({
           
           saveTimeoutRef.current = setTimeout(() => {
             if (applyingRemoteChangesRef.current) {
-              console.log('🔄 Skipping auto-save - applying remote changes');
+              console.log('ðŸ"„ Skipping auto-save - applying remote changes');
               saveTimeoutRef.current = null;
               return;
             }
@@ -1594,7 +1627,7 @@ const NoteEditor = ({
             }
             
             if (Object.keys(updates).length > 0) {
-              console.log('💾 Auto-saving changes:', updates);
+              console.log('ðŸ'¾ Auto-saving changes:', updates);
               saveNote(note.id, updates);
             }
             saveTimeoutRef.current = null;
@@ -1664,7 +1697,7 @@ const NoteEditor = ({
       
       // Increased from 30 seconds to 2 minutes since WebSocket provides real-time updates
       if (timeSinceLastBulkSync > 120000 && !bulkSyncInProgress) {
-        console.log('⏰ Periodic bulk sync triggered for collaborative note');
+        console.log('â° Periodic bulk sync triggered for collaborative note');
         handleManualBulkSync();
       }
     }, 60000); // Check every minute instead of 20 seconds
@@ -1799,7 +1832,7 @@ const NoteEditor = ({
               {syncingChanges && <SyncIcon color="primary" fontSize="small" className="rotating" />}
               {saving && <SaveIcon color="primary" fontSize="small" />}
               {hasUnsavedChanges && !saving && (
-                <Chip label="●" size="small" color="warning" sx={{ minWidth: 8, height: 8, '& .MuiChip-label': { px: 0 } }} />
+                <Chip label="â—" size="small" color="warning" sx={{ minWidth: 8, height: 8, '& .MuiChip-label': { px: 0 } }} />
               )}
               
               {isLocked && (
@@ -1955,23 +1988,23 @@ const NoteEditor = ({
           )}
 
           {/* Desktop Header */}
-{!isMobile && (
-  <Box sx={{ mb: 2, display: 'flex', alignItems: 'center', gap: 2 }}>
-    <TextField
-      fullWidth
-      variant="outlined"
-      placeholder="Note title..."
-      value={title}
-      onChange={handleTitleChange}
-      onFocus={handleTitleFocus}
-      disabled={!canEdit}
-      sx={{
-        '& .MuiOutlinedInput-root': {
-          fontSize: '1.5rem',
-          fontWeight: 500,
-        },
-      }}
-    />
+          {!isMobile && (
+            <Box sx={{ mb: 2, display: 'flex', alignItems: 'center', gap: 2 }}>
+              <TextField
+                fullWidth
+                variant="outlined"
+                placeholder="Note title..."
+                value={title}
+                onChange={handleTitleChange}
+                onFocus={handleTitleFocus}
+                disabled={!canEdit}
+                sx={{
+                  '& .MuiOutlinedInput-root': {
+                    fontSize: '1.5rem',
+                    fontWeight: 500,
+                  },
+                }}
+              />
 
               {/* Status chips */}
               <Box display="flex" gap={1} alignItems="center" flexShrink={0}>
@@ -2103,21 +2136,20 @@ const NoteEditor = ({
                   </Tooltip>
                 )}
 
-      <Tooltip title="Close note">
-        <IconButton
-          onClick={handleBack}
-          color="default"
-          size="small"
-          sx={{
-            '&:hover': {
-              bgcolor: 'action.hover',
-            }
-          }}
-        >
-          <CloseIcon />
-        </IconButton>
-      </Tooltip>
-
+                <Tooltip title="Close note">
+                  <IconButton
+                    onClick={handleBack}
+                    color="default"
+                    size="small"
+                    sx={{
+                      '&:hover': {
+                        bgcolor: 'action.hover',
+                      }
+                    }}
+                  >
+                    <CloseIcon />
+                  </IconButton>
+                </Tooltip>
               </Box>
             </Box>
           )}

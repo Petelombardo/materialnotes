@@ -85,6 +85,15 @@ router.use(passport.authenticate('jwt', { session: false }));
 // Apply mobile detection to all routes
 router.use(mobileDetectionMiddleware);
 
+// Initialize collaboration manager with Socket.IO when routes are loaded
+router.use((req, res, next) => {
+  const io = req.app.get('io');
+  if (io && !collaborationManager.io) {
+    collaborationManager.setSocketIO(io);
+  }
+  next();
+});
+
 // ===== HELPER FUNCTIONS =====
 
 // Helper function to resolve actual file path (handles symlinks)
@@ -260,7 +269,7 @@ async function processAndSaveImage(imageBuffer, userId, noteId, originalName) {
   };
 }
 
-// Enhanced function to sync shared note updates
+// Enhanced function to sync shared note updates WITH WebSocket integration
 async function syncSharedNoteUpdates(originalNoteInfo, updatedMetadata) {
   if (!originalNoteInfo.metadata.hasBeenShared && !updatedMetadata.shared) return;
 
@@ -320,6 +329,16 @@ async function syncSharedNoteUpdates(originalNoteInfo, updatedMetadata) {
         console.error(`❌ Failed to sync to participant ${participantId}:`, error);
       }
     }
+    
+    // NEW: Trigger WebSocket notification for real-time sync
+    await collaborationManager.emitNoteUpdate(originalNoteInfo.noteId, {
+      title: updatedMetadata.title,
+      updatedAt: updatedMetadata.updatedAt
+    }, {
+      id: updatedMetadata.lastEditedBy,
+      name: updatedMetadata.lastEditorName,
+      avatar: updatedMetadata.lastEditorAvatar
+    });
     
   } catch (error) {
     console.error('❌ Error syncing shared note updates:', error);
@@ -413,7 +432,7 @@ router.post('/bulk-sync', collaborationLimiter, async (req, res) => {
             
             results.statistics.updated++;
             
-            console.log(`📝 Note ${noteId} has updates`);
+            console.log(`🔍 Note ${noteId} has updates`);
           }
           
         } catch (error) {
@@ -652,7 +671,7 @@ router.get('/:noteId/updates', collaborationLimiter, async (req, res) => {
   }
 });
 
-// Enhanced: Register/unregister as active editor (Redis-backed with mobile support)
+// Enhanced: Register/unregister as active editor (Redis-backed with mobile support + WebSocket)
 router.post('/:noteId/presence', collaborationLimiter, async (req, res) => {
   try {
     const { noteId } = req.params;
@@ -704,7 +723,7 @@ router.post('/:noteId/presence', collaborationLimiter, async (req, res) => {
   }
 });
 
-// Enhanced: Get list of active editors for a note (Redis-backed with mobile info)
+// Enhanced: Get list of active editors for a note (Redis-backed with mobile info + WebSocket)
 router.get('/:noteId/presence', collaborationLimiter, async (req, res) => {
   try {
     const { noteId } = req.params;
@@ -742,7 +761,7 @@ router.get('/:noteId/presence', collaborationLimiter, async (req, res) => {
   }
 });
 
-// ===== EXISTING ENDPOINTS (Enhanced) =====
+// ===== EXISTING ENDPOINTS (Enhanced with WebSocket notifications) =====
 
 // Upload image to note
 router.post('/:id/images', upload.single('image'), async (req, res) => {
@@ -1084,8 +1103,7 @@ router.post('/', async (req, res) => {
   }
 });
 
-// Enhanced: Update note (with shared notes sync and improved presence tracking)
-// Enhanced: Update note (with shared notes sync and improved presence tracking)
+// Enhanced: Update note (with shared notes sync and improved presence tracking + WebSocket)
 router.put('/:id', async (req, res) => {
   const startTime = Date.now();
   
@@ -1134,7 +1152,7 @@ router.put('/:id', async (req, res) => {
       return res.status(404).json({ error: 'Note not found' });
     }
     
-    console.log('📝 Original note info found:', {
+    console.log('🔍 Original note info found:', {
       isShared: originalNoteInfo.isShared,
       ownerId: originalNoteInfo.ownerId,
       noteId: originalNoteInfo.noteId,
@@ -1187,6 +1205,18 @@ router.put('/:id', async (req, res) => {
     await syncSharedNoteUpdates(originalNoteInfo, updatedMetadata);
     console.log('⏱️ Shared notes sync completed:', Date.now() - startTime + 'ms');
     
+    // NEW: Trigger real-time WebSocket notification
+    await collaborationManager.triggerNoteSync(originalNoteInfo.noteId, {
+      title: updatedMetadata.title,
+      content,
+      updatedAt: now
+    }, {
+      id: req.user.id,
+      name: req.user.name,
+      avatar: req.user.avatar
+    });
+    console.log('⏱️ WebSocket notification sent:', Date.now() - startTime + 'ms');
+    
     // Update presence timestamp for this editor using Redis-backed manager
     const presenceNoteId = originalNoteInfo.noteId;
     try {
@@ -1233,9 +1263,8 @@ router.put('/:id', async (req, res) => {
     res.status(500).json({ error: 'Failed to update note' });
   }
 });
-// STOP
 
-// Delete note
+// Delete note (Enhanced with WebSocket cleanup)
 router.delete('/:id', async (req, res) => {
   try {
     const noteId = req.params.id;
@@ -1288,6 +1317,7 @@ router.get('/health/status', (req, res) => {
     status: 'OK', 
     timestamp: new Date().toISOString(),
     redis: collaborationManager ? 'available' : 'unavailable',
+    websocket: 'enabled',
     mobile: req.isMobile || false
   });
 });
