@@ -14,6 +14,9 @@ require('dotenv').config();
 const app = express();
 const server = http.createServer(app);
 
+// Trust proxy for rate limiting behind nginx
+app.set('trust proxy', true);
+
 // PORT with fallback
 const PORT = process.env.PORT || 3001;
 
@@ -179,38 +182,69 @@ const startServer = async () => {
       });
     });
 
-    // WebSocket authentication middleware
+    // Enhanced WebSocket authentication middleware with better error handling
     io.use(async (socket, next) => {
       try {
         const token = socket.handshake.auth.token || socket.handshake.headers.authorization?.replace('Bearer ', '');
         
         if (!token) {
+          console.warn('❌ WebSocket auth: No token provided');
           return next(new Error('Authentication token required'));
         }
 
         const jwt = require('jsonwebtoken');
-        const decoded = jwt.verify(token, process.env.JWT_SECRET || 'fallback-secret');
+        let decoded;
         
-        // Load user data (you might want to implement a user lookup function)
-        socket.userId = decoded.id;
-        socket.user = {
+        try {
+          decoded = jwt.verify(token, process.env.JWT_SECRET || 'fallback-secret');
+        } catch (jwtError) {
+          console.error('❌ WebSocket auth: JWT verification failed:', jwtError.message);
+          if (jwtError.name === 'TokenExpiredError') {
+            return next(new Error('Token expired'));
+          }
+          return next(new Error('Invalid token'));
+        }
+        
+        // Validate required user data fields
+        if (!decoded.id) {
+          console.error('❌ WebSocket auth: Missing user ID in token');
+          return next(new Error('Invalid token: missing user ID'));
+        }
+        
+        // DEBUG: Log what's actually in the token
+        console.log('🔍 JWT token contents:', {
           id: decoded.id,
           name: decoded.name,
           email: decoded.email,
-          avatar: decoded.avatar
+          avatar: decoded.avatar,
+          allKeys: Object.keys(decoded)
+        });
+        
+        // Create user object with defaults for missing fields
+        socket.userId = decoded.id;
+        socket.user = {
+          id: decoded.id,
+          name: decoded.name || decoded.email?.split('@')[0] || `User-${decoded.id.slice(-6)}`,
+          email: decoded.email || 'unknown@example.com',
+          avatar: decoded.avatar || null
         };
         
-        console.log(`🔌 WebSocket authenticated: ${socket.user.name} (${socket.userId})`);
+        console.log('👤 Created socket user object:', socket.user);
+        
+        // Generate unique connection ID to handle multiple devices
+        socket.connectionId = `${decoded.id}_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+        
+        console.log(`🔌 WebSocket authenticated: ${socket.user.name} (${socket.userId}) [${socket.connectionId}]`);
         next();
       } catch (error) {
-        console.error('WebSocket authentication failed:', error.message);
-        next(new Error('Authentication failed'));
+        console.error('❌ WebSocket authentication failed:', error.message);
+        next(new Error(`Authentication failed: ${error.message}`));
       }
     });
 
-    // WebSocket connection handling
+    // Enhanced WebSocket connection handling with better user identity management
     io.on('connection', (socket) => {
-      console.log(`🔌 User connected: ${socket.user.name} (${socket.userId})`);
+      console.log(`🔌 User connected: ${socket.user.name} (${socket.userId}) [Connection: ${socket.connectionId}]`);
 
       // Handle joining a note for collaboration
       socket.on('join-note', async (data) => {
@@ -225,12 +259,16 @@ const startServer = async () => {
           // Join socket room for the note
           socket.join(`note:${noteId}`);
           
-          // Add to collaboration manager
+          // Add to collaboration manager with connection-specific data
           const collaborationManager = require('./utils/collaborationManager');
-          await collaborationManager.addActiveEditor(noteId, socket.userId, {
+          await collaborationManager.addActiveEditor(noteId, socket.connectionId, {
+            userId: socket.userId,
             name: socket.user.name,
+            email: socket.user.email,
             avatar: socket.user.avatar,
-            socketId: socket.id
+            socketId: socket.id,
+            connectionId: socket.connectionId,
+            deviceType: socket.handshake.headers['user-agent']?.includes('Mobile') ? 'mobile' : 'desktop'
           });
 
           // Get current active editors
@@ -241,19 +279,23 @@ const startServer = async () => {
             noteId,
             activeEditors,
             action: 'join',
-            user: socket.user
+            user: {
+              ...socket.user,
+              connectionId: socket.connectionId
+            }
           });
 
           socket.emit('join-note-success', { 
             noteId, 
             activeEditors,
+            connectionId: socket.connectionId,
             message: 'Successfully joined note collaboration' 
           });
 
-          console.log(`👥 User ${socket.user.name} joined note ${noteId} collaboration`);
+          console.log(`👥 User ${socket.user.name} [${socket.connectionId}] joined note ${noteId} collaboration`);
         } catch (error) {
-          console.error('Error joining note:', error);
-          socket.emit('error', { message: 'Failed to join note collaboration' });
+          console.error('❌ Error joining note:', error);
+          socket.emit('error', { message: 'Failed to join note collaboration', details: error.message });
         }
       });
 
@@ -270,9 +312,9 @@ const startServer = async () => {
           // Leave socket room
           socket.leave(`note:${noteId}`);
           
-          // Remove from collaboration manager
+          // Remove from collaboration manager using connectionId
           const collaborationManager = require('./utils/collaborationManager');
-          await collaborationManager.removeActiveEditor(noteId, socket.userId);
+          await collaborationManager.removeActiveEditor(noteId, socket.connectionId);
 
           // Get updated active editors
           const activeEditors = await collaborationManager.getActiveEditors(noteId);
@@ -282,12 +324,15 @@ const startServer = async () => {
             noteId,
             activeEditors,
             action: 'leave',
-            user: socket.user
+            user: {
+              ...socket.user,
+              connectionId: socket.connectionId
+            }
           });
 
-          console.log(`👥 User ${socket.user.name} left note ${noteId} collaboration`);
+          console.log(`👥 User ${socket.user.name} [${socket.connectionId}] left note ${noteId} collaboration`);
         } catch (error) {
-          console.error('Error leaving note:', error);
+          console.error('❌ Error leaving note:', error);
         }
       });
 
@@ -324,15 +369,16 @@ const startServer = async () => {
           
           if (noteId) {
             const collaborationManager = require('./utils/collaborationManager');
-            await collaborationManager.updateEditorLastSeen(noteId, socket.userId);
+            await collaborationManager.updateEditorLastSeen(noteId, socket.connectionId);
           }
 
           socket.emit('heartbeat-ack', { 
             timestamp: new Date().toISOString(),
-            status: 'active'
+            status: 'active',
+            connectionId: socket.connectionId
           });
         } catch (error) {
-          console.error('Error handling heartbeat:', error);
+          console.error('❌ Error handling heartbeat:', error);
         }
       });
 
@@ -363,10 +409,10 @@ const startServer = async () => {
 
       // Handle disconnection
       socket.on('disconnect', async (reason) => {
-        console.log(`🔌 User disconnected: ${socket.user.name} (${socket.userId}) - ${reason}`);
+        console.log(`🔌 User disconnected: ${socket.user.name} [${socket.connectionId}] - ${reason}`);
         
         try {
-          // Clean up presence from all notes this user was editing
+          // Clean up presence from all notes this connection was editing
           const collaborationManager = require('./utils/collaborationManager');
           
           // Get all rooms this socket was in
@@ -375,7 +421,7 @@ const startServer = async () => {
           
           for (const room of noteRooms) {
             const noteId = room.replace('note:', '');
-            await collaborationManager.removeActiveEditor(noteId, socket.userId);
+            await collaborationManager.removeActiveEditor(noteId, socket.connectionId);
             
             // Get updated active editors
             const activeEditors = await collaborationManager.getActiveEditors(noteId);
@@ -385,17 +431,27 @@ const startServer = async () => {
               noteId,
               activeEditors,
               action: 'disconnect',
-              user: socket.user
+              user: {
+                ...socket.user,
+                connectionId: socket.connectionId
+              }
             });
           }
         } catch (error) {
-          console.error('Error during disconnect cleanup:', error);
+          console.error('❌ Error during disconnect cleanup:', error);
         }
       });
 
       // Handle errors
       socket.on('error', (error) => {
-        console.error(`WebSocket error for user ${socket.user.name}:`, error);
+        console.error(`❌ WebSocket error for user ${socket.user.name} [${socket.connectionId}]:`, error);
+      });
+      
+      // Send connection confirmation with user info
+      socket.emit('connection-confirmed', {
+        user: socket.user,
+        connectionId: socket.connectionId,
+        timestamp: new Date().toISOString()
       });
     });
 

@@ -133,21 +133,25 @@ class CollaborationManager {
         const now = new Date();
         const staleThreshold = 5 * 60 * 1000; // 5 minutes (increased for WebSocket reliability)
         
-        for (const [userId, editorData] of Object.entries(editors)) {
+        for (const [connectionId, editorData] of Object.entries(editors)) {
           try {
             const editor = JSON.parse(editorData);
             const lastSeen = new Date(editor.lastSeen);
             
             if (now - lastSeen <= staleThreshold) {
-              activeEditors.push(editor);
+              activeEditors.push({
+                ...editor,
+                name: editor.name || `User-${editor.userId?.slice(-6)}` || 'Unknown User',
+                displayName: editor.name || editor.email?.split('@')[0] || 'Unknown User'
+              });
             } else {
               // Remove stale editor
-              await redisClient.hdel(key, userId);
-              console.log(`🧹 Removed stale editor ${userId} from note ${noteId}`);
+              await redisClient.hdel(key, connectionId);
+              console.log(`🧹 Removed stale editor ${editor.name || connectionId} from note ${noteId}`);
             }
           } catch (parseError) {
-            console.error('Error parsing editor data:', parseError);
-            await redisClient.hdel(key, userId);
+            console.error('❌ Error parsing editor data:', parseError);
+            await redisClient.hdel(key, connectionId);
           }
         }
         
@@ -161,12 +165,16 @@ class CollaborationManager {
         const staleThreshold = 5 * 60 * 1000;
         const activeEditors = [];
         
-        for (const [userId, editor] of noteEditors.entries()) {
+        for (const [connectionId, editor] of noteEditors.entries()) {
           if (now - editor.lastSeen <= staleThreshold) {
-            activeEditors.push(editor);
+            activeEditors.push({
+              ...editor,
+              name: editor.name || `User-${editor.userId?.slice(-6)}` || 'Unknown User',
+              displayName: editor.name || editor.email?.split('@')[0] || 'Unknown User'
+            });
           } else {
-            noteEditors.delete(userId);
-            console.log(`🧹 Removed stale editor ${userId} from note ${noteId} (memory)`);
+            noteEditors.delete(connectionId);
+            console.log(`🧹 Removed stale editor ${editor.name || connectionId} from note ${noteId} (memory)`);
           }
         }
         
@@ -444,17 +452,17 @@ class CollaborationManager {
         for (const [noteId, editors] of this.fallbackActiveEditors.entries()) {
           const editorsToRemove = [];
           
-          for (const [userId, editor] of editors.entries()) {
+          for (const [connectionId, editor] of editors.entries()) {
             if (now - editor.lastSeen > staleThreshold) {
-              editorsToRemove.push({ userId, editor });
+              editorsToRemove.push({ connectionId, editor });
             }
           }
           
           // Remove stale editors and emit events
-          for (const { userId, editor } of editorsToRemove) {
-            editors.delete(userId);
-            await this.emitPresenceChange(noteId, 'timeout', userId, editor);
-            console.log(`🧹 Cleaned up stale editor ${userId} from note ${noteId}`);
+          for (const { connectionId, editor } of editorsToRemove) {
+            editors.delete(connectionId);
+            await this.emitPresenceChange(noteId, 'timeout', connectionId, editor);
+            console.log(`🧹 Cleaned up stale editor ${editor.name || connectionId} from note ${noteId}`);
           }
           
           if (editors.size === 0) {

@@ -25,6 +25,12 @@ async function safeCollaborationOperation(operation, fallbackValue = null) {
   }
 }
 
+// Helper function to generate content hash for change detection
+function generateContentHash(title, content) {
+  const combined = `${title || ''}|||${content || ''}`;
+  return crypto.createHash('sha256').update(combined, 'utf8').digest('hex').substring(0, 8);
+}
+
 
 // Mobile detection middleware
 const mobileDetectionMiddleware = (req, res, next) => {
@@ -40,7 +46,9 @@ const collaborationLimiter = rateLimit({
   windowMs: 1 * 60 * 1000, // 1 minute
   max: (req) => {
     // More generous limits for mobile devices and bulk operations
-    if (req.path.includes('/bulk-sync')) return req.isMobile ? 10 : 5;
+    if (req.path.includes('/bulk-sync') || req.path.includes('/efficient-sync') || req.path.includes('/sync-metadata')) {
+      return req.isMobile ? 15 : 10; // Increased for new efficient endpoints
+    }
     return req.isMobile ? 60 : 30;
   },
   standardHeaders: true,
@@ -605,8 +613,32 @@ router.get('/:noteId/updates', collaborationLimiter, async (req, res) => {
     if (updatedAt > sinceDate) {
       console.log('✅ Note has updates, returning content');
       
+      console.log('📝 Attempting to read note file:', {
+        noteFile: originalNoteInfo.noteFile,
+        exists: await fs.pathExists(originalNoteInfo.noteFile)
+      });
+      
       const realPath = await resolveNotePath(originalNoteInfo.noteFile);
-      const content = await fs.readFile(realPath, 'utf8');
+      console.log('📝 Resolved path:', {
+        realPath,
+        existsReal: await fs.pathExists(realPath)
+      });
+      
+      let content;
+      try {
+        content = await fs.readFile(realPath, 'utf8');
+        console.log('📝 File read result:', {
+          contentType: typeof content,
+          contentLength: content ? content.length : 0,
+          isEmptyString: content === '',
+          isUndefined: content === undefined,
+          isNull: content === null,
+          contentPreview: content ? content.substring(0, 50) + '...' : 'NO_CONTENT'
+        });
+      } catch (readError) {
+        console.error('❌ Error reading note file:', readError);
+        content = null;
+      }
       
       // Enhanced conflict detection using content hash
       let hasConflict = false;
@@ -952,6 +984,164 @@ router.get('/', async (req, res) => {
   } catch (error) {
     console.error('Error fetching notes:', error);
     res.status(500).json({ error: 'Failed to fetch notes' });
+  }
+});
+
+// GET /api/notes/sync-metadata - Efficient bulk sync metadata endpoint
+router.get('/sync-metadata', async (req, res) => {
+  try {
+    console.log('🔄 GET /api/notes/sync-metadata - User:', req.user.email);
+    
+    const userNotesDir = path.join(__dirname, '../data/notes', req.user.id);
+    await fs.ensureDir(userNotesDir);
+    
+    const metadataFile = path.join(userNotesDir, 'metadata.json');
+    const metadata = await fs.readJson(metadataFile).catch(() => ({}));
+    
+    const syncMetadata = {};
+    
+    for (const [id, meta] of Object.entries(metadata)) {
+      const noteFile = path.join(userNotesDir, `${id}.md`);
+      if (await fs.pathExists(noteFile)) {
+        const realPath = await resolveNotePath(noteFile);
+        const content = await fs.readFile(realPath, 'utf8');
+        
+        // Generate content hash for change detection
+        const contentHash = generateContentHash(meta.title, content);
+        
+        syncMetadata[id] = {
+          id: id,
+          updatedAt: meta.updatedAt,
+          contentHash: contentHash,
+          title: meta.title || '',
+          shared: meta.shared || false,
+          hasBeenShared: meta.hasBeenShared || false
+        };
+      }
+    }
+    
+    console.log(`✅ Returning sync metadata for ${Object.keys(syncMetadata).length} notes`);
+    
+    res.json({ 
+      metadata: syncMetadata,
+      serverTime: new Date().toISOString(),
+      count: Object.keys(syncMetadata).length
+    });
+  } catch (error) {
+    console.error('❌ Error fetching sync metadata:', error);
+    res.status(500).json({ error: 'Failed to fetch sync metadata' });
+  }
+});
+
+// POST /api/notes/efficient-sync - Intelligent bulk sync endpoint  
+router.post('/efficient-sync', async (req, res) => {
+  try {
+    console.log('⚡ POST /api/notes/efficient-sync - User:', req.user.email);
+    
+    const { clientMetadata, notesToFetch } = req.body;
+    
+    if (!clientMetadata || typeof clientMetadata !== 'object') {
+      return res.status(400).json({ error: 'clientMetadata object required' });
+    }
+    
+    if (!notesToFetch || !Array.isArray(notesToFetch)) {
+      return res.status(400).json({ error: 'notesToFetch array required' });
+    }
+    
+    const userNotesDir = path.join(__dirname, '../data/notes', req.user.id);
+    await fs.ensureDir(userNotesDir);
+    
+    const metadataFile = path.join(userNotesDir, 'metadata.json');
+    const serverMetadata = await fs.readJson(metadataFile).catch(() => ({}));
+    
+    const results = {
+      updatedNotes: [],
+      newNotes: [],
+      deletedNoteIds: [],
+      serverTime: new Date().toISOString(),
+      stats: {
+        clientNotes: Object.keys(clientMetadata).length,
+        serverNotes: Object.keys(serverMetadata).length,
+        checkedForUpdates: 0,
+        foundUpdates: 0,
+        skippedIdentical: 0
+      }
+    };
+    
+    const clientNoteIds = new Set(Object.keys(clientMetadata));
+    
+    console.log(`⚡ Intelligent sync: ${results.stats.clientNotes} client notes vs ${results.stats.serverNotes} server notes`);
+    
+    // Process only the specifically requested notes
+    for (const id of notesToFetch) {
+      const noteFile = path.join(userNotesDir, `${id}.md`);
+      if (!(await fs.pathExists(noteFile))) continue;
+      
+      const serverMeta = serverMetadata[id];
+      const clientMeta = clientMetadata[id];
+      results.stats.checkedForUpdates++;
+      
+      if (!serverMeta) {
+        console.log(`⚠️ Note ${id} requested but not found in server metadata`);
+        continue;
+      }
+      
+      // Note: Since this note is in notesToFetch, the frontend already knows about it
+      // and detected it needs updating. So it should ALWAYS be treated as "updated".
+      
+      // Get server content and generate hash
+      const realPath = await resolveNotePath(noteFile);
+      const content = await fs.readFile(realPath, 'utf8');
+      const serverHash = generateContentHash(serverMeta.title, content);
+      const clientHash = clientMeta.contentHash;
+      
+      // Note was requested for fetching, so return it as updated
+      const lockStatus = await fileLockManager.checkLock(id);
+      
+      const updatedNote = {
+        id,
+        title: serverMeta.title,
+        content,
+        createdAt: serverMeta.createdAt,
+        updatedAt: serverMeta.updatedAt,
+        shared: serverMeta.shared || false,
+        sharedBy: serverMeta.sharedBy || null,
+        hasBeenShared: serverMeta.hasBeenShared || false,
+        sharedWith: serverMeta.sharedWith || [],
+        permission: serverMeta.permission || 'edit',
+        locked: lockStatus.locked,
+        lockedBy: lockStatus.userId,
+        lockedUntil: lockStatus.expiresAt,
+        images: serverMeta.images || [],
+        lastEditedBy: serverMeta.lastEditedBy,
+        lastEditorName: serverMeta.lastEditorName,
+        lastEditorAvatar: serverMeta.lastEditorAvatar
+      };
+      
+      results.updatedNotes.push(updatedNote);
+      results.stats.foundUpdates++;
+      
+      console.log(`🔄 Fetched requested note ${id}: hash(${clientHash} → ${serverHash})`);
+    }
+    
+    // Any remaining client notes don't exist on server - they were deleted
+    results.deletedNoteIds = Array.from(clientNoteIds);
+    
+    const totalChanges = results.updatedNotes.length + results.newNotes.length + results.deletedNoteIds.length;
+    
+    console.log(`✅ Efficient sync complete:`, {
+      updatedNotes: results.updatedNotes.length,
+      newNotes: results.newNotes.length, 
+      deletedNotes: results.deletedNoteIds.length,
+      totalChanges,
+      efficiency: `${results.stats.skippedIdentical}/${results.stats.checkedForUpdates} notes skipped (${Math.round(results.stats.skippedIdentical/results.stats.checkedForUpdates*100)}%)`
+    });
+    
+    res.json(results);
+    
+  } catch (error) {
+    console.error('❌ Efficient sync failed:', error);
+    res.status(500).json({ error: 'Efficient sync operation failed' });
   }
 });
 

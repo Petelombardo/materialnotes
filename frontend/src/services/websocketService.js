@@ -230,6 +230,10 @@ class WebSocketService {
           this.emit('note-updated', data);
         });
 
+        this.socket.on('note-updated-broadcast', (data) => {
+          this.emit('note-updated', data);
+        });
+
         this.socket.on('presence-changed', (data) => {
           this.emit('presence-changed', data);
         });
@@ -244,6 +248,11 @@ class WebSocketService {
 
         this.socket.on('heartbeat-ack', (data) => {
           this.emit('heartbeat-ack', data);
+        });
+
+        this.socket.on('connection-confirmed', (data) => {
+          console.log('✅ Connection confirmed from server:', data);
+          this.emit('connection-confirmed', data);
         });
 
         this.socket.on('error', (error) => {

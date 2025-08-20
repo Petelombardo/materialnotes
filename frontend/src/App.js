@@ -125,8 +125,8 @@ function App() {
     }
   };
 
-  // Setup WebSocket event listeners
-  const setupWebSocketListeners = () => {
+  // Setup WebSocket connection event listeners (non-state dependent)
+  const setupWebSocketConnectionListeners = () => {
     if (!websocketService) return;
 
     // Connection events
@@ -134,6 +134,7 @@ function App() {
       console.log('🔌 WebSocket connection restored');
       setWebsocketConnected(true);
       setConnectionMode('websocket');
+      setReconnectAttempts(0);
       stopHttpPolling();
     });
 
@@ -157,34 +158,10 @@ function App() {
       startHttpPolling();
     });
 
-    // Real-time collaboration events
-    websocketService.on('note-updated', (data) => {
-      console.log('📝 Real-time note update received in App.js:', data);
-      
-      // Update the specific note in our notes array
-      setNotes(prevNotes => {
-        return prevNotes.map(note => {
-          if (note.id === data.noteId) {
-            return {
-              ...note,
-              title: data.updates.title || note.title,
-              content: data.updates.content || note.content,
-              updatedAt: data.timestamp || data.updatedAt,
-              lastEditedBy: data.editor?.id,
-              lastEditorName: data.editor?.name,
-              lastEditorAvatar: data.editor?.avatar
-            };
-          }
-          return note;
-        });
-      });
-      
-      // Update timestamps
-      setNotesTimestamps(prev => {
-        const updated = new Map(prev);
-        updated.set(data.noteId, new Date(data.timestamp || data.updatedAt).getTime());
-        return updated;
-      });
+    // Handle connection confirmation
+    websocketService.on('connection-confirmed', (data) => {
+      console.log('✅ WebSocket connection confirmed:', data.user.name);
+      setRealtimeActive(true);
     });
 
     websocketService.on('bulk-sync-response', (data) => {
@@ -198,47 +175,70 @@ function App() {
     });
   };
 
-  // NEW: Enhanced reconnectWebSocket function
+  // Enhanced reconnectWebSocket function with better error handling
 const reconnectWebSocket = async () => {
-  // IMPROVED: More thorough user and connectivity checks
+  // Check connectivity first
   if (!isOnline) {
     console.log('⚠️ Cannot reconnect WebSocket - offline');
+    setConnectionMode('offline');
     return;
   }
 
-  if (!user) {
-    console.log('⚠️ Cannot reconnect WebSocket - no user available');
-    console.log('🔄 Attempting to restore user session from token...');
+  // Validate token before attempting connection
+  const token = localStorage.getItem('token');
+  if (!token) {
+    console.log('❌ No auth token available for WebSocket connection');
+    setConnectionMode('http');
+    startHttpPolling();
+    return;
+  }
+
+  // Validate token format and expiration
+  try {
+    const payload = JSON.parse(atob(token.split('.')[1]));
+    const now = Date.now() / 1000;
     
-    const token = localStorage.getItem('token');
-    if (!token) {
-      console.log('❌ No token available for user restoration');
-      setConnectionMode('http');
-      startHttpPolling();
+    if (payload.exp && payload.exp < now) {
+      console.log('❌ Token expired, cannot reconnect WebSocket');
+      await handleAuthFailure();
       return;
     }
+    
+    if (!payload.id) {
+      console.log('❌ Invalid token: missing user ID');
+      await handleAuthFailure();
+      return;
+    }
+  } catch (error) {
+    console.error('❌ Token validation failed:', error);
+    await handleAuthFailure();
+    return;
+  }
 
+  // Ensure user session is available
+  if (!user) {
+    console.log('🔄 Restoring user session before WebSocket connection...');
+    
     try {
-      // Try to restore user session
       api.api.defaults.headers.common['Authorization'] = `Bearer ${token}`;
       const userData = await api.getCurrentUser();
       
       if (!userData) {
         console.log('❌ Could not restore user session');
-        setConnectionMode('http');
-        startHttpPolling();
+        await handleAuthFailure();
         return;
       }
       
-      console.log('✅ User session restored successfully:', userData.email);
+      console.log('✅ User session restored for WebSocket:', userData.email);
       setUser(userData);
-      
-      // Now continue with WebSocket connection using restored user
-      // Don't return here, continue to the connection logic below
     } catch (error) {
-      console.error('❌ Failed to restore user session:', error);
-      setConnectionMode('http');
-      startHttpPolling();
+      console.error('❌ Failed to restore user session for WebSocket:', error);
+      if (error.response?.status === 401) {
+        await handleAuthFailure();
+      } else {
+        setConnectionMode('http');
+        startHttpPolling();
+      }
       return;
     }
   }
@@ -248,20 +248,15 @@ const reconnectWebSocket = async () => {
     setConnectionMode('connecting');
     setReconnectAttempts(prev => prev + 1);
     
-    // Disconnect existing connection first
+    // Clean disconnect first
     if (websocketService) {
       websocketService.disconnect();
     }
     
-    // Small delay to ensure clean disconnection
+    // Wait for clean disconnection
     await new Promise(resolve => setTimeout(resolve, 1000));
-    
-    const token = localStorage.getItem('token');
-    if (!token) {
-      throw new Error('No auth token available');
-    }
 
-    console.log('🔌 Connecting WebSocket with token...');
+    console.log('🔌 Connecting WebSocket with validated token...');
     await websocketService.connect(token);
     
     setWebsocketConnected(true);
@@ -270,10 +265,10 @@ const reconnectWebSocket = async () => {
     
     console.log('✅ WebSocket reconnected successfully');
     
-    // Stop HTTP polling since we have WebSocket again
+    // Stop HTTP polling since we have WebSocket
     stopHttpPolling();
     
-    // If we have a selected note, rejoin its collaboration
+    // Rejoin note collaboration if needed
     if (selectedNote) {
       console.log('🤝 Rejoining note collaboration after reconnect');
       setTimeout(() => {
@@ -284,16 +279,22 @@ const reconnectWebSocket = async () => {
   } catch (error) {
     console.error('❌ WebSocket reconnection failed:', error);
     setWebsocketConnected(false);
-    setConnectionMode('http');
     
-    // Fall back to HTTP polling
-    console.log('🔄 Falling back to HTTP polling after reconnection failure');
+    // Handle specific error types
+    if (error.message?.includes('Token expired') || error.message?.includes('Authentication failed')) {
+      console.log('❌ Authentication failed, clearing session');
+      await handleAuthFailure();
+      return;
+    }
+    
+    setConnectionMode('http');
+    console.log('🔄 Falling back to HTTP polling after WebSocket failure');
     startHttpPolling();
     
-    // Retry reconnection with exponential backoff (max 3 attempts)
-    if (reconnectAttempts < 3) {
+    // Retry with exponential backoff (max 3 attempts)
+    if (reconnectAttempts < 3 && isOnline) {
       const delay = Math.min(5000 * Math.pow(2, reconnectAttempts), 30000);
-      console.log(`🔄 Will retry WebSocket reconnection in ${delay/1000}s (attempt ${reconnectAttempts + 1}/3)`);
+      console.log(`🔄 Will retry WebSocket in ${delay/1000}s (attempt ${reconnectAttempts + 1}/3)`);
       
       setTimeout(() => {
         if (isOnline && !websocketConnected) {
@@ -301,7 +302,7 @@ const reconnectWebSocket = async () => {
         }
       }, delay);
     } else {
-      console.log('❌ Max WebSocket reconnection attempts reached, staying on HTTP polling');
+      console.log('❌ Max WebSocket reconnection attempts reached or offline');
     }
   }
 };
@@ -441,17 +442,24 @@ const reconnectWebSocket = async () => {
           console.log('✅ Applied HTTP updates to', updatedNotes.length, 'notes:', updatedNotes);
         }
         
-        // Update selected note if it was changed
+        // CRITICAL FIX: Update selected note if it was changed
         if (selectedNote) {
           const updatedSelectedNote = allNotes.find(note => note.id === selectedNote.id);
-          if (updatedSelectedNote && updatedSelectedNote.updatedAt !== selectedNote.updatedAt) {
-            console.log('🔄 Updating selected note via HTTP:', {
-              id: selectedNote.id,
-              title: selectedNote.title || 'Untitled',
-              oldTime: selectedNote.updatedAt,
-              newTime: updatedSelectedNote.updatedAt
-            });
-            setSelectedNote(updatedSelectedNote);
+          if (updatedSelectedNote) {
+            const selectedNoteTime = selectedNote.updatedAt ? new Date(selectedNote.updatedAt).getTime() : 0;
+            const updatedNoteTime = updatedSelectedNote.updatedAt ? new Date(updatedSelectedNote.updatedAt).getTime() : 0;
+            
+            // Update if timestamps differ OR if we don't have updatedAt on selected note
+            if (updatedNoteTime !== selectedNoteTime || !selectedNote.updatedAt) {
+              console.log('🔄 Updating selected note via HTTP:', {
+                id: selectedNote.id,
+                title: selectedNote.title || 'Untitled',
+                oldTime: selectedNote.updatedAt,
+                newTime: updatedSelectedNote.updatedAt,
+                contentChanged: selectedNote.content !== updatedSelectedNote.content
+              });
+              setSelectedNote(updatedSelectedNote);
+            }
           }
         }
         
@@ -472,6 +480,40 @@ const reconnectWebSocket = async () => {
   // Handle notes updated from WebSocket or bulk sync
   const handleNotesUpdated = (updatedNotes) => {
     console.log('🔥 Handling note updates from WebSocket/bulk sync:', updatedNotes.length);
+    
+    // DEBUG: Log what we're about to process
+    if (updatedNotes.length > 0) {
+      console.log('🔍 First updated note sample:', {
+        id: updatedNotes[0].id,
+        title: updatedNotes[0].title,
+        content: updatedNotes[0].content?.substring(0, 100) + '...',
+        updatedAt: updatedNotes[0].updatedAt
+      });
+    }
+    
+    // DEBUG: Log current selected note before update
+    if (selectedNote) {
+      console.log('🔍 Current selected note before update:', {
+        id: selectedNote.id,
+        title: selectedNote.title,
+        content: selectedNote.content?.substring(0, 100) + '...',
+        updatedAt: selectedNote.updatedAt
+      });
+    }
+    
+    // First, identify which note needs to be updated for selected note (BEFORE state update)
+    const selectedNoteUpdate = selectedNote ? 
+      updatedNotes.find(note => note.id === selectedNote.id) : null;
+    
+    if (selectedNoteUpdate) {
+      console.log('📝 Selected note will be updated with:', {
+        selectedNoteId: selectedNote.id,
+        noteId: selectedNoteUpdate.id,
+        oldContent: selectedNote.content?.substring(0, 100) + '...',
+        newContent: selectedNoteUpdate.content?.substring(0, 100) + '...',
+        contentChanged: selectedNote.content !== selectedNoteUpdate.content
+      });
+    }
     
     // Update the notes state with the new data
     setNotes(prevNotes => {
@@ -498,13 +540,22 @@ const reconnectWebSocket = async () => {
       return updated;
     });
     
-    // Update selected note if it was affected
-    if (selectedNote) {
-      const updatedSelectedNote = updatedNotes.find(note => note.id === selectedNote.id);
-      if (updatedSelectedNote) {
-        console.log('🔄 Updating selected note from WebSocket/bulk sync');
-        setSelectedNote(updatedSelectedNote);
-      }
+    // CRITICAL FIX: Update selected note if it was affected (NOW WORKS!)
+    if (selectedNoteUpdate) {
+      console.log('🔄 Updating selected note from bulk sync:', {
+        noteId: selectedNoteUpdate.id,
+        title: selectedNoteUpdate.title,
+        contentLength: selectedNoteUpdate.content?.length,
+        fullContent: selectedNoteUpdate.content?.substring(0, 200) + '...'
+      });
+      setSelectedNote(selectedNoteUpdate);
+    } else {
+      console.log('⚠️ No selected note update found in bulk sync results:', {
+        selectedNoteId: selectedNote?.id,
+        updatedNotesCount: updatedNotes.length,
+        updatedNoteIds: updatedNotes.map(note => note.id),
+        firstUpdatedNote: updatedNotes[0]?.id
+      });
     }
     
     setLastBulkSync(new Date());
@@ -1164,10 +1215,86 @@ const setupOfflineListeners = () => {
   useEffect(() => {
     if (user) {
       console.log('🔌 User authenticated, setting up WebSocket...');
-      setupWebSocketListeners();
+      setupWebSocketConnectionListeners();
       initializeWebSocket();
     }
   }, [user]);
+  
+  // Setup WebSocket real-time note update listeners (depends on selectedNote)
+  useEffect(() => {
+    if (!websocketService) return;
+    
+    console.log('🔧 Setting up WebSocket note-updated handler for selectedNote:', selectedNote?.id);
+    
+    const handleNoteUpdated = (data) => {
+      console.log('📝 [NEW HANDLER] Real-time note update received in App.js:', data.noteId);
+      
+      let updatedNote = null;
+      
+      // Update the specific note in our notes array
+      setNotes(prevNotes => {
+        return prevNotes.map(note => {
+          if (note.id === data.noteId) {
+            updatedNote = {
+              ...note,
+              title: data.updates.title !== undefined ? data.updates.title : note.title,
+              content: data.updates.content !== undefined ? data.updates.content : note.content,
+              updatedAt: data.timestamp || data.updatedAt,
+              lastEditedBy: data.editor?.id,
+              lastEditorName: data.editor?.name,
+              lastEditorAvatar: data.editor?.avatar
+            };
+            return updatedNote;
+          }
+          return note;
+        });
+      });
+      
+      // CRITICAL FIX: Update selectedNote if it's the note being updated
+      // This now has access to the current selectedNote state
+      if (selectedNote && selectedNote.id === data.noteId && updatedNote) {
+        console.log('🔄 [SUCCESS] Updating selectedNote with real-time changes:', {
+          noteId: data.noteId,
+          selectedNoteId: selectedNote.id,
+          oldContent: selectedNote.content?.substring(0, 50) + '...',
+          newContent: updatedNote.content?.substring(0, 50) + '...'
+        });
+        setSelectedNote(updatedNote);
+      } else {
+        console.log('⚠️ [FAILED] Real-time update not applied to selectedNote:', {
+          hasSelectedNote: !!selectedNote,
+          selectedNoteId: selectedNote?.id,
+          updateNoteId: data.noteId,
+          hasUpdatedNote: !!updatedNote,
+          idsMatch: selectedNote?.id === data.noteId
+        });
+      }
+      
+      // Update timestamps
+      setNotesTimestamps(prev => {
+        const updated = new Map(prev);
+        updated.set(data.noteId, new Date(data.timestamp || data.updatedAt).getTime());
+        return updated;
+      });
+    };
+    
+    // Add the handler (don't remove old ones for now to avoid breaking existing functionality)
+    websocketService.on('note-updated', handleNoteUpdated);
+    console.log('✅ WebSocket note-updated handler registered');
+    
+    // Cleanup function
+    return () => {
+      console.log('🧧 Cleaning up WebSocket note-updated handler');
+      try {
+        if (websocketService && websocketService.off) {
+          websocketService.off('note-updated', handleNoteUpdated);
+        }
+      } catch (error) {
+        console.warn('⚠️ Error removing WebSocket handler:', error);
+      }
+    };
+    
+  }, [selectedNote]); // Re-run when selectedNote changes
 
   // Event handlers
   const handleNoteSelect = async (note) => {
@@ -1247,7 +1374,7 @@ const setupOfflineListeners = () => {
   };
 
   const checkAuth = async () => {
-    console.log('Starting auth check...');
+    console.log('🔑 Starting authentication check...');
     
     try {
       const token = localStorage.getItem('token');
@@ -1259,6 +1386,26 @@ const setupOfflineListeners = () => {
         return;
       }
 
+      // Validate token format and expiration before making API calls
+      try {
+        const payload = JSON.parse(atob(token.split('.')[1]));
+        const now = Date.now() / 1000;
+        
+        if (payload.exp && payload.exp < now) {
+          console.log('❌ Token expired during auth check');
+          await handleAuthFailure();
+          setLoading(false);
+          return;
+        }
+        
+        console.log('✅ Token format valid, expiry check passed');
+      } catch (tokenError) {
+        console.error('❌ Token validation failed:', tokenError);
+        await handleAuthFailure();
+        setLoading(false);
+        return;
+      }
+
       api.api.defaults.headers.common['Authorization'] = `Bearer ${token}`;
       
       console.log('Attempting to get current user...');
@@ -1266,50 +1413,59 @@ const setupOfflineListeners = () => {
       console.log('getCurrentUser result:', !!userData, userData?.email);
       
       if (userData) {
-        console.log('User authenticated successfully:', userData.email);
+        console.log('✅ User authenticated successfully:', userData.email);
         setUser(userData);
         await loadNotes();
         
-        // Note: WebSocket initialization happens in useEffect when user is set
+        // WebSocket initialization happens in useEffect when user is set
         
         const urlParams = new URLSearchParams(window.location.search);
         if (urlParams.get('action') === 'new') {
           setTimeout(() => createNote(), 500);
         }
       } else {
-        console.log('No valid user data available - but NOT clearing token yet');
-        console.log('This might be a temporary issue, trying one more time...');
+        console.log('⚠️ No valid user data received - this may be a temporary issue');
         
+        // Single retry with shorter timeout
         setTimeout(async () => {
           try {
+            console.log('🔄 Retrying user authentication...');
             const userData2 = await api.getCurrentUser();
             if (userData2) {
-              console.log('Second attempt successful:', userData2.email);
+              console.log('✅ Retry successful:', userData2.email);
               setUser(userData2);
               await loadNotes();
             } else {
-              console.log('Second attempt also failed, clearing auth');
+              console.log('❌ Retry failed, clearing auth');
               await handleAuthFailure();
             }
           } catch (error2) {
-            console.error('Second auth attempt failed:', error2);
+            console.error('❌ Auth retry failed:', error2);
+            if (error2.response?.status === 401) {
+              await handleAuthFailure();
+            }
           } finally {
             setLoading(false);
           }
-        }, 2000);
+        }, 1000); // Reduced from 2000ms
         return;
       }
     } catch (error) {
-      console.error('Auth check failed with error:', error);
+      console.error('❌ Auth check failed:', error);
       
       if (error.response?.status === 401) {
-        console.log('401 error - definitely clearing token');
+        console.log('❌ 401 Unauthorized - clearing session');
         await handleAuthFailure();
+      } else if (error.response?.status === 429) {
+        console.log('⚠️ Rate limited during auth check');
+        setErrorMessage('Server is busy. Please wait a moment and try again.');
+        setShowErrorDialog(true);
       } else if (!isOnline) {
-        console.log('Offline auth check failed - keeping token, user can retry');
+        console.log('⚠️ Offline during auth check - keeping session');
+        setConnectionMode('offline');
       } else {
-        console.log('Non-auth error - keeping token, user can retry');
-        setErrorMessage('Failed to verify authentication. Please check your connection and try again.');
+        console.log('⚠️ Network error during auth check');
+        setErrorMessage('Failed to verify authentication. Please check your connection.');
         setShowErrorDialog(true);
       }
     } finally {
@@ -1318,15 +1474,30 @@ const setupOfflineListeners = () => {
   };
 
   const handleAuthFailure = async () => {
+    console.log('❌ Handling authentication failure - clearing session');
+    
+    // Stop all connection attempts
     stopHttpPolling();
     if (websocketService) {
       websocketService.disconnect();
     }
+    
+    // Reset connection state
     setWebsocketConnected(false);
     setConnectionMode('offline');
+    setRealtimeActive(false);
+    setReconnectAttempts(0);
+    
+    // Clear auth data
     localStorage.removeItem('token');
     delete api.api.defaults.headers.common['Authorization'];
     await api.clearAuthData();
+    
+    // Clear user state to trigger re-login
+    setUser(null);
+    setNotes([]);
+    setSelectedNote(null);
+    setNotesTimestamps(new Map());
   };
 
   const logout = async () => {
@@ -1631,12 +1802,11 @@ const setupOfflineListeners = () => {
             </Box>
           )}
 
-          {shouldShowEditor && selectedNote && (
+          {shouldShowEditor && selectedNote && (!isMobile || mobileView === 'editor') && (
             <Box
               sx={{
                 flexGrow: 1,
                 width: isMobile ? '100%' : 'auto',
-                display: isMobile && mobileView !== 'editor' ? 'none' : 'block',
                 position: isMobile ? 'absolute' : 'relative',
                 top: 0,
                 left: 0,

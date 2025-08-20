@@ -3,10 +3,16 @@ import offlineStorage from './offlineStorage';
 
 class OfflineCapableAPI {
   constructor() {
+    // Use the correct port (3002) for both development and production
+   // this.baseURL = process.env.NODE_ENV === 'production' 
+   //   ? '' 
+   //   : 'http://localhost:3002';
+//   this.baseURL = process.env.REACT_APP_API_URL || '';
+
     this.baseURL = process.env.NODE_ENV === 'production' 
-      ? '' 
-      : 'http://localhost:3001';
-    
+      ? '' // Use relative URLs in production (same domain)
+      : 'http://localhost:3002';
+
     // Start with conservative online detection
     this.isOnline = navigator.onLine;
     this.syncInProgress = false;
@@ -171,7 +177,9 @@ class OfflineCapableAPI {
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 3000); // Reduced timeout for local dev
       
-      const response = await fetch(this.baseURL + '/health', { 
+      // Use correct URL for health check
+      const healthUrl = this.baseURL || '';
+      const response = await fetch(healthUrl + '/health', { 
         method: 'GET',
         cache: 'no-cache',
         signal: controller.signal
@@ -307,8 +315,8 @@ class OfflineCapableAPI {
   async get(url) {
     if (url === '/api/notes') {
       return this.getNotes();
-    } else if (url.match(/^\/api\/notes\/[^\/]+$/)) {
-      // Only match single note URLs like /api/notes/{noteId} (no additional path segments)
+    } else if (url.match(/^\/api\/notes\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i)) {
+      // Only match single note URLs with UUID format like /api/notes/{uuid}
       const noteId = url.split('/').pop();
       return this.getNote(noteId);
     } else {

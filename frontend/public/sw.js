@@ -2,8 +2,6 @@ const CACHE_NAME = 'material-notes-v1';
 const API_CACHE_NAME = 'material-notes-api-v1';
 const urlsToCache = [
   '/',
-  '/static/js/bundle.js',
-  '/static/css/main.css',
   '/manifest.json',
   'https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&display=swap',
 ];
