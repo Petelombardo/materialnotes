@@ -32,7 +32,23 @@ class FileLockManager {
         const existingLock = await fs.readJson(lockFilePath);
         const isExpired = Date.now() - existingLock.timestamp > existingLock.timeout;
         
-        if (!isExpired && existingLock.userId !== userId) {
+        // SAME USER: Always allow same user to acquire lock (multiple connections/devices)
+        if (existingLock.userId === userId) {
+          console.log(`🔄 Same user (${userId}) acquiring lock for note ${noteId} - refreshing existing lock`);
+          // Refresh the lock with new timestamp
+          await fs.writeJson(lockFilePath, lockInfo);
+          this.locks.set(noteId, lockInfo);
+          
+          // Set auto-cleanup timer
+          setTimeout(() => {
+            this.releaseLock(noteId, userId).catch(console.error);
+          }, timeoutMs);
+          
+          return { success: true, lockInfo };
+        }
+        
+        // DIFFERENT USER: Only block if not expired
+        if (!isExpired) {
           return {
             success: false,
             error: 'Note is being edited by another user',
@@ -41,11 +57,9 @@ class FileLockManager {
           };
         }
         
-        // If expired or same user, remove old lock
-        if (isExpired || existingLock.userId === userId) {
-          await fs.remove(lockFilePath);
-          this.locks.delete(noteId);
-        }
+        // Expired lock - remove it
+        await fs.remove(lockFilePath);
+        this.locks.delete(noteId);
       }
 
       // Create new lock
@@ -130,10 +144,9 @@ class FileLockManager {
         }
       }
 
-      return {
-        success: false,
-        error: 'Lock not found'
-      };
+      // Lock not found - try to acquire it instead (graceful fallback)
+      console.log(`⚠️ Lock not found for note ${noteId}, attempting to acquire new lock for user ${userId}`);
+      return await this.acquireLock(noteId, userId, additionalTimeMs);
 
     } catch (error) {
       console.error('Error extending lock:', error);

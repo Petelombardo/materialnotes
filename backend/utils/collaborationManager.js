@@ -1,6 +1,14 @@
 // Enhanced utils/collaborationManager.js - Redis-backed collaboration with WebSocket integration
 const { getRedisClients } = require('../config/redis');
 
+// Development logging utility
+const isDevelopment = process.env.NODE_ENV !== 'production';
+const devLog = (...args) => {
+  if (isDevelopment) {
+    console.log(...args);
+  }
+};
+
 class CollaborationManager {
   constructor() {
     this.fallbackActiveEditors = new Map(); // Fallback for when Redis unavailable
@@ -10,13 +18,185 @@ class CollaborationManager {
   // Set Socket.IO instance for real-time events
   setSocketIO(ioInstance) {
     this.io = ioInstance;
-    console.log('🔌 CollaborationManager: Socket.IO instance configured');
+    devLog('🔌 CollaborationManager: Socket.IO instance configured');
+  }
+
+  // Clean up old connections for the same user (fixes standby/resume connectionId mismatch)
+  async cleanupOldUserConnections(noteId, newConnectionId, actualUserId) {
+    const { redisClient } = getRedisClients();
+    
+    try {
+      devLog(`🧹 Cleaning up old connections for user ${actualUserId} in note ${noteId} (keeping ${newConnectionId})`);
+      
+      if (redisClient) {
+        const key = `active_editors:${noteId}`;
+        const allEditors = await redisClient.hgetall(key);
+        
+        for (const [connectionId, editorDataString] of Object.entries(allEditors)) {
+          if (connectionId === newConnectionId) continue; // Skip the new connection
+          
+          try {
+            const editorData = JSON.parse(editorDataString);
+            
+            // Remove old connections for the same user
+            if (editorData.userId === actualUserId && connectionId !== newConnectionId) {
+              devLog(`🗑️ Removing old connection ${connectionId} for user ${actualUserId} (new: ${newConnectionId})`);
+              await redisClient.hdel(key, connectionId);
+              
+              // Emit presence change for the old connection being removed
+              await this.emitPresenceChange(noteId, 'cleanup', connectionId, editorData);
+            }
+          } catch (parseError) {
+            console.error(`Error parsing editor data for cleanup: ${parseError.message}`);
+            // Remove corrupted entries
+            await redisClient.hdel(key, connectionId);
+          }
+        }
+      } else {
+        // Fallback to memory cleanup
+        if (this.fallbackActiveEditors.has(noteId)) {
+          const noteEditors = this.fallbackActiveEditors.get(noteId);
+          const connectionsToRemove = [];
+          
+          for (const [connectionId, editorData] of noteEditors.entries()) {
+            if (editorData.userId === actualUserId && connectionId !== newConnectionId) {
+              connectionsToRemove.push({ connectionId, editorData });
+            }
+          }
+          
+          // Remove old connections
+          for (const { connectionId, editorData } of connectionsToRemove) {
+            noteEditors.delete(connectionId);
+            await this.emitPresenceChange(noteId, 'cleanup', connectionId, editorData);
+          }
+        }
+      }
+    } catch (error) {
+      console.error('Error cleaning up old user connections:', error);
+    }
+  }
+
+  // Clean up ALL old connections for a user across all notes (for global connection cleanup)
+  async cleanupAllUserConnections(actualUserId, newConnectionId) {
+    const { redisClient } = getRedisClients();
+    
+    try {
+      
+      // TEMPORARY: Disable aggressive socket cleanup to test if it's causing the issue
+      // await this.cleanupStaleSocketsFromRooms(actualUserId, newConnectionId);
+      
+      if (redisClient) {
+        // Get all active editor keys
+        const keys = await redisClient.keys('active_editors:*');
+        
+        for (const key of keys) {
+          const noteId = key.replace('active_editors:', '');
+          const allEditors = await redisClient.hgetall(key);
+          
+          for (const [connectionId, editorDataString] of Object.entries(allEditors)) {
+            if (connectionId === newConnectionId) continue; // Skip the new connection
+            
+            try {
+              const editorData = JSON.parse(editorDataString);
+              
+              // Remove old connections for this user
+              if (editorData.userId === actualUserId) {
+                console.log(`🗑️ Global cleanup: removing connection ${connectionId} from note ${noteId} for user ${actualUserId}`);
+                await redisClient.hdel(key, connectionId);
+                
+                // CRITICAL: Release file locks when cleaning up old connections
+                try {
+                  const fileLockManager = require('./fileLock');
+                  const lockStatus = await fileLockManager.checkLock(noteId);
+                  if (lockStatus.locked && lockStatus.userId === actualUserId) {
+                    await fileLockManager.releaseLock(noteId, actualUserId);
+                    console.log(`🔓 Released lock for note ${noteId} during global cleanup (user: ${actualUserId})`);
+                  }
+                } catch (lockError) {
+                  console.error(`❌ Error releasing lock for note ${noteId} during cleanup:`, lockError);
+                }
+                
+                // Emit presence change for cleanup
+                await this.emitPresenceChange(noteId, 'global-cleanup', connectionId, editorData);
+              }
+            } catch (parseError) {
+              console.error(`Error parsing editor data during global cleanup: ${parseError.message}`);
+              await redisClient.hdel(key, connectionId);
+            }
+          }
+        }
+      } else {
+        // Fallback to memory cleanup across all notes
+        for (const [noteId, noteEditors] of this.fallbackActiveEditors.entries()) {
+          const connectionsToRemove = [];
+          
+          for (const [connectionId, editorData] of noteEditors.entries()) {
+            if (editorData.userId === actualUserId && connectionId !== newConnectionId) {
+              console.log(`🗑️ Global memory cleanup: removing connection ${connectionId} from note ${noteId}`);
+              connectionsToRemove.push({ connectionId, editorData });
+            }
+          }
+          
+          // Remove old connections
+          for (const { connectionId, editorData } of connectionsToRemove) {
+            noteEditors.delete(connectionId);
+            
+            // CRITICAL: Release file locks when cleaning up old connections (memory fallback)
+            try {
+              const fileLockManager = require('./fileLock');
+              const lockStatus = await fileLockManager.checkLock(noteId);
+              if (lockStatus.locked && lockStatus.userId === actualUserId) {
+                await fileLockManager.releaseLock(noteId, actualUserId);
+                console.log(`🔓 Released lock for note ${noteId} during global cleanup (memory fallback, user: ${actualUserId})`);
+              }
+            } catch (lockError) {
+              console.error(`❌ Error releasing lock for note ${noteId} during cleanup (memory fallback):`, lockError);
+            }
+            
+            await this.emitPresenceChange(noteId, 'global-cleanup', connectionId, editorData);
+          }
+        }
+      }
+    } catch (error) {
+      console.error('Error during global user connection cleanup:', error);
+    }
+  }
+
+  // Clean up stale sockets from Socket.IO rooms (CRITICAL for fixing server→client communication)
+  async cleanupStaleSocketsFromRooms(actualUserId, newConnectionId) {
+    if (!this.io) return;
+    
+    try {
+      console.log(`🧹 Cleaning up stale sockets from rooms for user ${actualUserId}`);
+      
+      // Get all connected sockets
+      const sockets = await this.io.fetchSockets();
+      
+      for (const socket of sockets) {
+        // Skip if this is the new connection
+        if (socket.connectionId === newConnectionId) continue;
+        
+        // Check if this is a stale connection for the same user
+        if (socket.userId === actualUserId) {
+          console.log(`🗑️ Found stale socket ${socket.id} (connection: ${socket.connectionId}) for user ${actualUserId}`);
+          
+          // Force disconnect the stale socket
+          socket.disconnect(true);
+          console.log(`🔌 Forcibly disconnected stale socket for user ${actualUserId}`);
+        }
+      }
+    } catch (error) {
+      console.error('Error cleaning up stale sockets from rooms:', error);
+    }
   }
 
   async addActiveEditor(noteId, userId, editorInfo) {
     const { redisClient } = getRedisClients();
     
     try {
+      // FIRST: Clean up any old connections for this user to prevent duplicates
+      await this.cleanupOldUserConnections(noteId, userId, editorInfo.userId);
+      
       if (redisClient) {
         const key = `active_editors:${noteId}`;
         const editorData = {
@@ -26,6 +206,13 @@ class CollaborationManager {
           lastSeen: new Date().toISOString(),
           isOnline: true
         };
+        
+        console.log(`👤 Storing editor data for ${editorInfo.name || 'Unknown'}:`, {
+          connectionId: userId,
+          userId: editorInfo.userId,
+          name: editorInfo.name,
+          email: editorInfo.email
+        });
         
         await redisClient.hset(key, userId, JSON.stringify(editorData));
         await redisClient.expire(key, 600); // 10 minutes TTL
@@ -141,8 +328,8 @@ class CollaborationManager {
             if (now - lastSeen <= staleThreshold) {
               activeEditors.push({
                 ...editor,
-                name: editor.name || `User-${editor.userId?.slice(-6)}` || 'Unknown User',
-                displayName: editor.name || editor.email?.split('@')[0] || 'Unknown User'
+                name: editor.name || editor.displayName || editor.email?.split('@')[0] || `User-${editor.userId?.slice(-6)}` || 'Unknown User',
+                displayName: editor.name || editor.displayName || editor.email?.split('@')[0] || 'Unknown User'
               });
             } else {
               // Remove stale editor
@@ -169,8 +356,8 @@ class CollaborationManager {
           if (now - editor.lastSeen <= staleThreshold) {
             activeEditors.push({
               ...editor,
-              name: editor.name || `User-${editor.userId?.slice(-6)}` || 'Unknown User',
-              displayName: editor.name || editor.email?.split('@')[0] || 'Unknown User'
+              name: editor.name || editor.displayName || editor.email?.split('@')[0] || `User-${editor.userId?.slice(-6)}` || 'Unknown User',
+              displayName: editor.name || editor.displayName || editor.email?.split('@')[0] || 'Unknown User'
             });
           } else {
             noteEditors.delete(connectionId);
@@ -290,7 +477,7 @@ class CollaborationManager {
   async emitNoteUpdate(noteId, updates, editorInfo) {
     try {
       if (this.io) {
-        this.io.to(`note:${noteId}`).emit('note-updated-broadcast', {
+        this.io.to(`note:${noteId}`).emit('note-updated', {
           noteId,
           updates,
           editor: editorInfo,

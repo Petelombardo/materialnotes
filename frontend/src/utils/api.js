@@ -79,15 +79,24 @@ class OfflineCapableAPI {
         if (this.isActualNetworkError(error)) {
           this.failedRequestCount++;
           this.consecutiveFailures++;
-          console.log(`Network error detected (${this.consecutiveFailures} consecutive):`, error.message);
           
-          // Only switch to offline after multiple consecutive failures AND if browser also thinks we're offline
-          // OR if we get a clear network timeout/connection refused
+          if (error.response?.status === 429) {
+            console.log(`Rate limiting detected (429) - treating as network error (${this.consecutiveFailures} consecutive)`);
+          } else {
+            console.log(`Network error detected (${this.consecutiveFailures} consecutive):`, error.message);
+          }
+          
+          // Switch to offline after multiple consecutive failures OR clear network/server errors
           const isClearNetworkFailure = error.code === 'ECONNABORTED' || error.code === 'ECONNREFUSED' || error.code === 'ENOTFOUND';
-          const shouldGoOffline = (this.consecutiveFailures >= 3 && !navigator.onLine) || isClearNetworkFailure;
+          const isClearServerFailure = error.response?.status === 429 || error.response?.status === 502 || error.response?.status === 503;
+          const shouldGoOffline = (this.consecutiveFailures >= 2) || isClearNetworkFailure || isClearServerFailure;
           
           if (shouldGoOffline) {
-            console.log('Switching to offline mode due to network errors');
+            if (isClearServerFailure) {
+              console.log(`Switching to offline mode due to server error: ${error.response?.status}`);
+            } else {
+              console.log('Switching to offline mode due to network errors');
+            }
             this.setOnlineStatus(false);
           }
         } else {
@@ -116,19 +125,40 @@ class OfflineCapableAPI {
     // Start connectivity monitoring (less aggressive)
     this.startConnectivityMonitoring();
     
+    // Expose API service globally for WebSocket integration
+    if (typeof window !== 'undefined') {
+      window.apiService = this;
+    }
+    
     // Test connectivity on startup with a small delay
     setTimeout(() => {
       this.testConnectivity();
     }, 2000);
   }
 
-  // Set online status and dispatch events
-  setOnlineStatus(isOnline) {
+  // Set online status and dispatch events - ENHANCED to sync with WebSocket
+  setOnlineStatus(isOnline, reason = 'api') {
     const wasOnline = this.isOnline;
     this.isOnline = isOnline;
     
-    if (wasOnline !== isOnline) {
-      if (isOnline) {
+    // If WebSocket service exists and reports different state, sync with it
+    if (typeof window !== 'undefined' && window.websocketService) {
+      const wsConnected = window.websocketService.isConnected && window.websocketService.isConnected();
+      
+      // If WebSocket is connected but API thinks we're offline, trust WebSocket for some operations
+      if (wsConnected && !isOnline && reason === 'api') {
+        console.log('🔄 WebSocket connected but API offline - using hybrid mode');
+        this.isOnline = true; // Allow basic operations
+        this.hybridMode = true; // Track this special state
+      } else {
+        this.hybridMode = false;
+      }
+    }
+    
+    if (wasOnline !== this.isOnline) {
+      console.log(`🔗 API connectivity: ${this.isOnline ? 'online' : 'offline'} (${reason})${this.hybridMode ? ' [hybrid]' : ''}`);
+      
+      if (this.isOnline) {
         this.failedRequestCount = 0;
         this.consecutiveFailures = 0;
         this.syncPendingChanges();
@@ -177,17 +207,27 @@ class OfflineCapableAPI {
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 3000); // Reduced timeout for local dev
       
-      // Use correct URL for health check
+      // Use backend API endpoint that definitely requires the backend
       const healthUrl = this.baseURL || '';
-      const response = await fetch(healthUrl + '/health', { 
-        method: 'GET',
-        cache: 'no-cache',
+      const token = localStorage.getItem('token');
+      const headers = {
+        'Cache-Control': 'no-cache'
+      };
+      if (token) {
+        headers['Authorization'] = `Bearer ${token}`;
+      }
+      
+      const response = await fetch(healthUrl + '/api/notes', { 
+        method: 'HEAD', // Just check if endpoint exists, don't need data
+        headers,
         signal: controller.signal
       });
       
       clearTimeout(timeoutId);
       
-      const isOnline = response.ok;
+      // 401 means backend is running but not authenticated - still "online"
+      // 200, 401, 403, etc. all mean backend is responding
+      const isOnline = response.status < 500;
       console.log('Connectivity test result:', { 
         ok: response.ok, 
         status: response.status,
@@ -264,8 +304,9 @@ class OfflineCapableAPI {
       error.code === 'ETIMEDOUT' ||
       error.message.includes('Network Error') ||
       error.message.includes('net::ERR_') ||
-      error.message.includes('Failed to fetch')
-      // Removed server errors (502, 503, 504) as they don't necessarily mean client is offline
+      error.message.includes('Failed to fetch') ||
+      // Add back server errors that indicate backend is down or unavailable
+      (error.response && (error.response.status === 429 || error.response.status === 502 || error.response.status === 503))
     );
   }
 
@@ -350,8 +391,72 @@ class OfflineCapableAPI {
         const response = await this.retryRequest(() => this.api.get('/api/notes'));
         const notes = response.data;
         
-        // Cache the notes locally
-        await offlineStorage.storeNotes(notes, currentUser.id);
+        // CRITICAL: Handle offline changes properly during reconnection
+        console.log('🔄 Processing server notes with offline change detection');
+        
+        for (const note of notes) {
+          // Get current cached version before any updates
+          const cachedNote = await offlineStorage.getCachedNote(note.id);
+          
+          if (!cachedNote) {
+            // No cached version - safe to store server version
+            await offlineStorage.storeNote(note, currentUser.id, { fromServer: true });
+            continue;
+          }
+          
+          // Check for local changes by comparing cached content to original baseline
+          const cachedHash = await offlineStorage.generateContentHash(cachedNote.title, cachedNote.content);
+          const originalHash = cachedNote.originalHash;
+          const hasLocalChanges = cachedHash !== originalHash;
+          
+          if (process.env.NODE_ENV === 'development') {
+            console.log(`🔍 Offline change check for note ${note.id}:`, {
+              cachedHash: cachedHash?.substring(0, 8),
+              originalHash: originalHash?.substring(0, 8), 
+              serverHash: note.contentHash?.substring(0, 8),
+              hasLocalChanges,
+              serverNewer: new Date(note.updatedAt) > new Date(cachedNote.updatedAt)
+            });
+          }
+          
+          if (!hasLocalChanges) {
+            // No local changes - safe to update with server version
+            await offlineStorage.storeNote(note, currentUser.id, { fromServer: true });
+            if (process.env.NODE_ENV === 'development') {
+              console.log(`✅ No local changes for note ${note.id}, accepting server version`);
+            }
+          } else {
+            // Has local changes - preserve them and trigger conflict resolution
+            console.log(`⚠️ Local changes detected for note ${note.id}, preserving cached version`);
+            
+            // Update cached note with server metadata but keep local content
+            const preservedNote = {
+              ...cachedNote,
+              // Keep local content changes
+              title: cachedNote.title,
+              content: cachedNote.content,
+              // Update server metadata
+              updatedAt: note.updatedAt,
+              serverVersion: {
+                title: note.title,
+                content: note.content,
+                contentHash: note.contentHash,
+                updatedAt: note.updatedAt
+              },
+              needsConflictResolution: true
+            };
+            
+            // Store with fromServer: false to preserve originalHash
+            await offlineStorage.storeNote(preservedNote, currentUser.id, { fromServer: false });
+            
+            // Trigger conflict resolution in the UI
+            this.dispatchEvent('offline-conflict-detected', {
+              noteId: note.id,
+              localVersion: cachedNote,
+              serverVersion: note
+            });
+          }
+        }
         await offlineStorage.storeMetadata('lastSync', Date.now());
         
         return response;
@@ -380,10 +485,10 @@ class OfflineCapableAPI {
         const response = await this.retryRequest(() => this.api.get(`/api/notes/${noteId}`));
         const note = response.data;
         
-        // Cache the note locally
+        // Cache the note locally (from server)
         const currentUser = await this.getCurrentUser();
         if (currentUser) {
-          await offlineStorage.storeNote(note, currentUser.id);
+          await offlineStorage.storeNote(note, currentUser.id, { fromServer: true });
         }
         
         return response;
@@ -442,8 +547,8 @@ class OfflineCapableAPI {
         const response = await this.retryRequest(() => this.api.post('/api/notes', data));
         const note = response.data;
         
-        // Cache the new note
-        await offlineStorage.storeNote(note, currentUser.id);
+        // Cache the new note (from server)
+        await offlineStorage.storeNote(note, currentUser.id, { fromServer: true });
         
         return response;
       } catch (error) {
@@ -526,8 +631,8 @@ class OfflineCapableAPI {
         const response = await this.retryRequest(() => this.api.put(`/api/notes/${noteId}`, data));
         const note = response.data;
         
-        // Update cache
-        await offlineStorage.storeNote(note, currentUser.id);
+        // Update cache (from server)
+        await offlineStorage.storeNote(note, currentUser.id, { fromServer: true });
         
         return response;
       } catch (error) {
@@ -643,7 +748,10 @@ class OfflineCapableAPI {
       // If we have cached user data and a token, validate token expiry
       if (user && token) {
         const isTokenValid = this.isTokenValid(token);
-        console.log('Auth Debug:', { hasUser: !!user, hasToken: !!token, isTokenValid, isOnline: this.isOnline });
+        // Reduced auth debug logging frequency
+        if (Math.random() < 0.1) { // Only log 10% of the time
+          console.log('Auth Debug:', { hasUser: !!user, hasToken: !!token, isTokenValid, isOnline: this.isOnline });
+        }
         
         if (isTokenValid) {
           // Token is valid, return cached user
@@ -798,7 +906,7 @@ class OfflineCapableAPI {
             ...newNote,
             offline: false,
             pendingSync: false
-          }, currentUser.id);
+          }, currentUser.id, { fromServer: true });
         }
         break;
         

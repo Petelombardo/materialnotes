@@ -1,13 +1,16 @@
-const CACHE_NAME = 'material-notes-v1';
-const API_CACHE_NAME = 'material-notes-api-v1';
+const CACHE_VERSION = new Date().toISOString().split('T')[0].replace(/-/g, ''); // YYYYMMDD format
+const CACHE_NAME = `material-notes-${CACHE_VERSION}`;
+const API_CACHE_NAME = `material-notes-api-${CACHE_VERSION}`;
 const urlsToCache = [
   '/',
   '/manifest.json',
   'https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&display=swap',
 ];
 
-// Install event - cache resources
+// Install event - cache resources and auto-update
 self.addEventListener('install', (event) => {
+  console.log('📦 New service worker installing...');
+  
   event.waitUntil(
     caches.open(CACHE_NAME)
       .then((cache) => {
@@ -16,6 +19,11 @@ self.addEventListener('install', (event) => {
       })
       .catch((error) => {
         console.log('Cache addAll failed:', error);
+      })
+      .finally(() => {
+        // Skip waiting and immediately activate the new service worker
+        console.log('🔄 Skipping waiting, activating new service worker immediately');
+        self.skipWaiting();
       })
   );
 });
@@ -132,20 +140,26 @@ async function handleApiRequest(request) {
   }
 }
 
-// Activate event - clean up old caches
+// Activate event - clean up old caches and take control immediately
 self.addEventListener('activate', (event) => {
+  console.log('✅ New service worker activated');
   const cacheWhitelist = [CACHE_NAME, API_CACHE_NAME];
   
   event.waitUntil(
-    caches.keys().then((cacheNames) => {
-      return Promise.all(
-        cacheNames.map((cacheName) => {
-          if (cacheWhitelist.indexOf(cacheName) === -1) {
-            return caches.delete(cacheName);
-          }
-        })
-      );
-    })
+    Promise.all([
+      // Clean up old caches
+      caches.keys().then((cacheNames) => {
+        return Promise.all(
+          cacheNames.map((cacheName) => {
+            if (cacheWhitelist.indexOf(cacheName) === -1) {
+              return caches.delete(cacheName);
+            }
+          })
+        );
+      }),
+      // Take control of all pages immediately for auto-update
+      self.clients.claim()
+    ])
   );
 });
 
@@ -218,3 +232,4 @@ self.addEventListener('message', (event) => {
     self.skipWaiting();
   }
 });
+

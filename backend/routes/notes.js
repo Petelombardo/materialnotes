@@ -9,6 +9,7 @@ const crypto = require('crypto');
 const rateLimit = require('express-rate-limit');
 const fileLockManager = require('../utils/fileLock');
 const collaborationManager = require('../utils/collaborationManager');
+const clientSyncTracker = require('../utils/clientSyncTracker');
 const router = express.Router();
 
 // ===== MIDDLEWARE SETUP =====
@@ -25,9 +26,27 @@ async function safeCollaborationOperation(operation, fallbackValue = null) {
   }
 }
 
+// Normalize content to prevent hash differences from whitespace/formatting
+function normalizeContent(content) {
+  if (!content) return '';
+  return content
+    .replace(/\r\n/g, '\n')                    // Normalize line endings (Windows)
+    .replace(/\r/g, '\n')                     // Handle old Mac line endings  
+    .replace(/\s+$/gm, '')                    // Remove trailing whitespace from each line
+    .replace(/(<p><\/p>)+/g, '')              // Remove empty paragraphs anywhere (not just end)
+    .replace(/(<p><br><\/p>)+/g, '')          // Remove paragraphs containing only <br>
+    .replace(/(<p>\s*<\/p>)+/g, '')           // Remove paragraphs with only whitespace
+    .replace(/>\s+</g, '><')                  // Remove whitespace between tags
+    .replace(/\s+/g, ' ')                     // Normalize multiple spaces to single space
+    .trim();                                  // Remove leading/trailing whitespace
+}
+
 // Helper function to generate content hash for change detection
 function generateContentHash(title, content) {
-  const combined = `${title || ''}|||${content || ''}`;
+  // CRITICAL: Normalize content before hashing to match client behavior
+  const normalizedContent = normalizeContent(content || '');
+  const normalizedTitle = (title || '').trim();
+  const combined = `${normalizedTitle}|||${normalizedContent}`;
   return crypto.createHash('sha256').update(combined, 'utf8').digest('hex').substring(0, 8);
 }
 
@@ -357,8 +376,9 @@ async function syncSharedNoteUpdates(originalNoteInfo, updatedMetadata) {
 
 router.post('/bulk-sync', collaborationLimiter, async (req, res) => {
   try {
-    const { noteTimestamps } = req.body; // { noteId: timestamp, ... }
+    const { noteTimestamps, clientId } = req.body; // { noteId: timestamp, ... }
     const userId = req.user.id;
+    const effectiveClientId = clientId || `user_${userId}_${Date.now()}`;
     
     if (!noteTimestamps || typeof noteTimestamps !== 'object') {
       return res.status(400).json({ error: 'Invalid noteTimestamps format' });
@@ -430,17 +450,42 @@ router.post('/bulk-sync', collaborationLimiter, async (req, res) => {
               avatar: originalNoteInfo.metadata.lastEditorAvatar
             } : null;
             
+            // Generate content hash for this note
+            const currentContentHash = generateContentHash(originalNoteInfo.metadata.title, content);
+            
+            // Get what we last sent to this client for conflict detection
+            const lastSentToClient = await clientSyncTracker.getLastSentToClient(effectiveClientId, noteId);
+            
             results.updates[noteId] = {
               content,
               title: originalNoteInfo.metadata.title,
               updatedAt: originalNoteInfo.metadata.updatedAt,
               lastEditor,
-              noteId
+              noteId,
+              // Enhanced conflict detection metadata
+              contentHash: currentContentHash,
+              lastSentToClient: lastSentToClient,
+              syncMetadata: {
+                serverHash: currentContentHash,
+                clientLastKnownHash: lastSentToClient,
+                canDetectConflicts: !!lastSentToClient
+              }
             };
+            
+            // Record that we're sending this hash to the client
+            await clientSyncTracker.recordSentToClient(effectiveClientId, noteId, currentContentHash);
             
             results.statistics.updated++;
             
             console.log(`🔍 Note ${noteId} has updates`);
+          } else {
+            // No updates, but still record the current hash for future conflict detection
+            const realPath = await resolveNotePath(originalNoteInfo.noteFile);
+            const content = await fs.readFile(realPath, 'utf8');
+            const currentContentHash = generateContentHash(originalNoteInfo.metadata.title, content);
+            
+            // Record that this client is up-to-date with this hash
+            await clientSyncTracker.recordSentToClient(effectiveClientId, noteId, currentContentHash);
           }
           
         } catch (error) {
@@ -955,6 +1000,9 @@ router.get('/', async (req, res) => {
         
         const lockStatus = await fileLockManager.checkLock(id);
         
+        // Generate content hash for change detection
+        const contentHash = generateContentHash(meta.title, content);
+        
         notes.push({
           id,
           title: meta.title,
@@ -972,7 +1020,8 @@ router.get('/', async (req, res) => {
           images: meta.images || [],
           lastEditedBy: meta.lastEditedBy,
           lastEditorName: meta.lastEditorName,
-          lastEditorAvatar: meta.lastEditorAvatar
+          lastEditorAvatar: meta.lastEditorAvatar,
+          contentHash: contentHash
         });
       }
     }
@@ -1115,7 +1164,8 @@ router.post('/efficient-sync', async (req, res) => {
         images: serverMeta.images || [],
         lastEditedBy: serverMeta.lastEditedBy,
         lastEditorName: serverMeta.lastEditorName,
-        lastEditorAvatar: serverMeta.lastEditorAvatar
+        lastEditorAvatar: serverMeta.lastEditorAvatar,
+        contentHash: serverHash
       };
       
       results.updatedNotes.push(updatedNote);
@@ -1163,6 +1213,9 @@ router.get('/:id', async (req, res) => {
     
     const lockStatus = await fileLockManager.checkLock(req.params.id);
     
+    // Generate content hash for change detection
+    const contentHash = generateContentHash(meta.title || 'Untitled', content);
+    
     res.json({
       id: req.params.id,
       title: meta.title || 'Untitled',
@@ -1180,7 +1233,8 @@ router.get('/:id', async (req, res) => {
       images: meta.images || [],
       lastEditedBy: meta.lastEditedBy,
       lastEditorName: meta.lastEditorName,
-      lastEditorAvatar: meta.lastEditorAvatar
+      lastEditorAvatar: meta.lastEditorAvatar,
+      contentHash: contentHash
     });
   } catch (error) {
     console.error('Error fetching note:', error);
@@ -1199,15 +1253,25 @@ router.post('/:id/lock', async (req, res) => {
       return res.status(403).json({ error: 'No edit permission for this note' });
     }
     
+    console.log(`🔐 Attempting to acquire lock for note ${noteId} by user ${userId}`);
     const result = await fileLockManager.acquireLock(noteId, userId);
     
+    console.log(`🔐 Lock acquisition result for note ${noteId}:`, {
+      success: result.success,
+      error: result.error,
+      lockedBy: result.lockedBy,
+      requestingUser: userId
+    });
+    
     if (result.success) {
+      console.log(`✅ Lock acquired for note ${noteId} by user ${userId}`);
       res.json({ 
         success: true, 
         message: 'Lock acquired',
         expiresAt: result.lockInfo.timestamp + result.lockInfo.timeout
       });
     } else {
+      console.log(`❌ Lock acquisition failed for note ${noteId}:`, result);
       res.status(409).json(result);
     }
   } catch (error) {
@@ -1417,10 +1481,10 @@ router.put('/:id', async (req, res) => {
       console.log('⏱️ Collaboration manager error handled:', Date.now() - startTime + 'ms');
     }
     
-    // Extend lock if user has it
+    // Release lock after successful save
     if (lockStatus.locked && lockStatus.userId === userId) {
-      await fileLockManager.extendLock(noteId, userId);
-      console.log('⏱️ Lock extension completed:', Date.now() - startTime + 'ms');
+      await fileLockManager.releaseLock(noteId, userId);
+      console.log('⏱️ Lock released after successful save:', Date.now() - startTime + 'ms');
     }
     
     // Return updated note data
@@ -1450,6 +1514,17 @@ router.put('/:id', async (req, res) => {
     const totalTime = Date.now() - startTime;
     console.error('❌ Error updating note after', totalTime + 'ms:', error);
     console.error('❌ Error stack:', error.stack);
+    
+    // Release lock on error to prevent stuck locks
+    try {
+      if (lockStatus && lockStatus.locked && lockStatus.userId === userId) {
+        await fileLockManager.releaseLock(noteId, userId);
+        console.log('⏱️ Lock released after error:', totalTime + 'ms');
+      }
+    } catch (lockError) {
+      console.error('❌ Failed to release lock after error:', lockError);
+    }
+    
     res.status(500).json({ error: 'Failed to update note' });
   }
 });

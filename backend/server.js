@@ -6,10 +6,21 @@ const RedisStore = require('connect-redis').default;
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const path = require('path');
+const fs = require('fs-extra');
 const http = require('http');
 const { Server } = require('socket.io');
 const { initializeRedis, getRedisClients, closeRedisConnections } = require('./config/redis');
+const batchingManager = require('./utils/batchingManager');
+const clientSyncTracker = require('./utils/clientSyncTracker');
 require('dotenv').config();
+
+// Development logging utility
+const isDevelopment = process.env.NODE_ENV !== 'production';
+const devLog = (...args) => {
+  if (isDevelopment) {
+    console.log(...args);
+  }
+};
 
 const app = express();
 const server = http.createServer(app);
@@ -36,13 +47,13 @@ const parseWebSocketCorsOrigins = () => {
     'http://localhost:8080'
   ];
   
-  console.log('⚠️ WEBSOCKET_CORS_ORIGINS not found in environment, using fallback origins:', fallbackOrigins);
+  devLog('⚠️ WEBSOCKET_CORS_ORIGINS not found in environment, using fallback origins:', fallbackOrigins);
   return fallbackOrigins;
 };
 
 // Get CORS origins from environment
 const corsOrigins = parseWebSocketCorsOrigins();
-console.log('🌐 Using CORS origins:', corsOrigins);
+devLog('🌐 Using CORS origins:', corsOrigins);
 
 // Initialize Redis before starting server
 let redisClient;
@@ -68,10 +79,13 @@ const startServer = async () => {
       pingInterval: parseInt(process.env.WEBSOCKET_PING_INTERVAL) || 25000
     });
 
-    console.log('🔌 Socket.IO configured with:');
-    console.log('   - CORS origins:', corsOrigins);
-    console.log('   - Ping timeout:', io.engine.opts.pingTimeout);
-    console.log('   - Ping interval:', io.engine.opts.pingInterval);
+    devLog('🔌 Socket.IO configured with:');
+    devLog('   - CORS origins:', corsOrigins);
+    devLog('   - Ping timeout:', io.engine.opts.pingTimeout);
+    devLog('   - Ping interval:', io.engine.opts.pingInterval);
+
+    // Configure batching manager with Socket.IO instance
+    batchingManager.setSocketIO(io);
 
     // Security middleware
     app.use(helmet({
@@ -117,7 +131,8 @@ const startServer = async () => {
       credentials: true
     }));
 
-    console.log('🌐 Express CORS configured with origins:', corsOrigins);
+    devLog('🌐 Express CORS configured with origins:', corsOrigins);
+
 
     // Body parsing middleware
     app.use(express.json({ limit: '10mb' }));
@@ -142,9 +157,9 @@ const startServer = async () => {
         prefix: 'notes-session:',
         ttl: 24 * 60 * 60 // 24 hours in seconds
       });
-      console.log('✅ Using Redis session store');
+      devLog('✅ Using Redis session store');
     } else {
-      console.log('⚠️ Using memory session store (not recommended for production)');
+      devLog('⚠️ Using memory session store (not recommended for production)');
     }
 
     app.use(session(sessionConfig));
@@ -188,7 +203,6 @@ const startServer = async () => {
         const token = socket.handshake.auth.token || socket.handshake.headers.authorization?.replace('Bearer ', '');
         
         if (!token) {
-          console.warn('❌ WebSocket auth: No token provided');
           return next(new Error('Authentication token required'));
         }
 
@@ -198,7 +212,6 @@ const startServer = async () => {
         try {
           decoded = jwt.verify(token, process.env.JWT_SECRET || 'fallback-secret');
         } catch (jwtError) {
-          console.error('❌ WebSocket auth: JWT verification failed:', jwtError.message);
           if (jwtError.name === 'TokenExpiredError') {
             return next(new Error('Token expired'));
           }
@@ -207,34 +220,32 @@ const startServer = async () => {
         
         // Validate required user data fields
         if (!decoded.id) {
-          console.error('❌ WebSocket auth: Missing user ID in token');
           return next(new Error('Invalid token: missing user ID'));
         }
         
-        // DEBUG: Log what's actually in the token
-        console.log('🔍 JWT token contents:', {
-          id: decoded.id,
-          name: decoded.name,
-          email: decoded.email,
-          avatar: decoded.avatar,
-          allKeys: Object.keys(decoded)
-        });
         
-        // Create user object with defaults for missing fields
+        // Look up full user data from users.json (same as Passport JWT strategy)
+        const usersFile = path.join(__dirname, 'data/users.json');
+        const users = await fs.readJson(usersFile).catch(() => ({}));
+        const fullUser = users[decoded.id];
+        
+        if (!fullUser) {
+          throw new Error(`User ${decoded.id} not found in users database`);
+        }
+        
         socket.userId = decoded.id;
         socket.user = {
-          id: decoded.id,
-          name: decoded.name || decoded.email?.split('@')[0] || `User-${decoded.id.slice(-6)}`,
-          email: decoded.email || 'unknown@example.com',
-          avatar: decoded.avatar || null
+          id: fullUser.id,
+          name: fullUser.name || fullUser.email?.split('@')[0] || `User-${decoded.id.slice(-6)}`,
+          email: fullUser.email || 'unknown@example.com',
+          avatar: fullUser.avatar || null
         };
         
-        console.log('👤 Created socket user object:', socket.user);
+        devLog('👤 WebSocket user authenticated:', socket.user.name);
         
         // Generate unique connection ID to handle multiple devices
         socket.connectionId = `${decoded.id}_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
         
-        console.log(`🔌 WebSocket authenticated: ${socket.user.name} (${socket.userId}) [${socket.connectionId}]`);
         next();
       } catch (error) {
         console.error('❌ WebSocket authentication failed:', error.message);
@@ -243,8 +254,16 @@ const startServer = async () => {
     });
 
     // Enhanced WebSocket connection handling with better user identity management
-    io.on('connection', (socket) => {
-      console.log(`🔌 User connected: ${socket.user.name} (${socket.userId}) [Connection: ${socket.connectionId}]`);
+    io.on('connection', async (socket) => {
+      devLog(`🔌 User connected: ${socket.user.name} (${socket.userId}) [${socket.connectionId}]`);
+      
+      // CRITICAL FIX: Clean up old connections for this user to prevent standby/resume duplicates
+      try {
+        const collaborationManager = require('./utils/collaborationManager');
+        await collaborationManager.cleanupAllUserConnections(socket.userId, socket.connectionId);
+      } catch (error) {
+        console.error('❌ Error cleaning up old connections on connect:', error);
+      }
 
       // Handle joining a note for collaboration
       socket.on('join-note', async (data) => {
@@ -292,7 +311,7 @@ const startServer = async () => {
             message: 'Successfully joined note collaboration' 
           });
 
-          console.log(`👥 User ${socket.user.name} [${socket.connectionId}] joined note ${noteId} collaboration`);
+          devLog(`👥 User ${socket.user.name} joined note ${noteId} collaboration`);
         } catch (error) {
           console.error('❌ Error joining note:', error);
           socket.emit('error', { message: 'Failed to join note collaboration', details: error.message });
@@ -330,7 +349,6 @@ const startServer = async () => {
             }
           });
 
-          console.log(`👥 User ${socket.user.name} [${socket.connectionId}] left note ${noteId} collaboration`);
         } catch (error) {
           console.error('❌ Error leaving note:', error);
         }
@@ -346,16 +364,22 @@ const startServer = async () => {
             return;
           }
 
+          // Add to server-side batching queue for persistence
+          await batchingManager.addUpdate(noteId, updates, socket.user);
+
           // Broadcast update to all other users editing this note (except sender)
-          socket.to(`note:${noteId}`).emit('note-updated', {
+          const updateData = {
             noteId,
             updates,
             timestamp,
             editor: socket.user,
+            connectionId: socket.connectionId,
             updatedAt: new Date().toISOString()
-          });
+          };
+          
+          
+          socket.to(`note:${noteId}`).emit('note-updated', updateData);
 
-          console.log(`📝 Note ${noteId} updated by ${socket.user.name} - broadcasting to collaborators`);
         } catch (error) {
           console.error('Error handling note update:', error);
           socket.emit('error', { message: 'Failed to broadcast note update' });
@@ -400,7 +424,6 @@ const startServer = async () => {
             notesCount: Object.keys(noteTimestamps).length
           });
 
-          console.log(`📱 Bulk sync requested by ${socket.user.name} for ${Object.keys(noteTimestamps).length} notes`);
         } catch (error) {
           console.error('Error handling bulk sync:', error);
           socket.emit('error', { message: 'Bulk sync request failed' });
@@ -409,11 +432,12 @@ const startServer = async () => {
 
       // Handle disconnection
       socket.on('disconnect', async (reason) => {
-        console.log(`🔌 User disconnected: ${socket.user.name} [${socket.connectionId}] - ${reason}`);
+        devLog(`🔌 User disconnected: ${socket.user.name} [${socket.connectionId}] - ${reason}`);
         
         try {
           // Clean up presence from all notes this connection was editing
           const collaborationManager = require('./utils/collaborationManager');
+          const fileLockManager = require('./utils/fileLock');
           
           // Get all rooms this socket was in
           const rooms = Array.from(socket.rooms);
@@ -422,6 +446,17 @@ const startServer = async () => {
           for (const room of noteRooms) {
             const noteId = room.replace('note:', '');
             await collaborationManager.removeActiveEditor(noteId, socket.connectionId);
+            
+            // CRITICAL: Release file locks when connection is lost to prevent stuck locks
+            try {
+              const lockStatus = await fileLockManager.checkLock(noteId);
+              
+              if (lockStatus.locked && lockStatus.userId === socket.userId) {
+                await fileLockManager.releaseLock(noteId, socket.userId);
+              }
+            } catch (lockError) {
+              console.error(`❌ Error releasing lock for note ${noteId}:`, lockError);
+            }
             
             // Get updated active editors
             const activeEditors = await collaborationManager.getActiveEditors(noteId);
@@ -447,12 +482,45 @@ const startServer = async () => {
         console.error(`❌ WebSocket error for user ${socket.user.name} [${socket.connectionId}]:`, error);
       });
       
-      // Send connection confirmation with user info
-      socket.emit('connection-confirmed', {
+      // Send connection confirmation with user info (with circuit breaker)
+      const connectionConfirmation = {
         user: socket.user,
         connectionId: socket.connectionId,
         timestamp: new Date().toISOString()
-      });
+      };
+      
+      // EMERGENCY: Stronger server-side circuit breaker for connection confirmations
+      if (socket._connectionConfirmedCount === undefined) {
+        socket._connectionConfirmedCount = 0;
+        socket._connectionConfirmedStartTime = Date.now();
+      }
+      
+      const now = Date.now();
+      const timeWindow = 60000; // 1 minute window
+      const maxEventsPerWindow = 2; // Only 2 connection confirmations per minute per socket
+      
+      // Reset counter if window expired
+      if (now - socket._connectionConfirmedStartTime > timeWindow) {
+        socket._connectionConfirmedCount = 0;
+        socket._connectionConfirmedStartTime = now;
+      }
+      
+      // Block if too many events in current window
+      if (socket._connectionConfirmedCount >= maxEventsPerWindow) {
+        console.log(`🚫 [SERVER EMERGENCY BREAKER] Blocked connection-confirmed for ${socket.user.name} - limit exceeded (${socket._connectionConfirmedCount}/${maxEventsPerWindow})`);
+        return;
+      }
+      
+      // Also check rapid succession (less than 2 seconds)
+      if (socket._lastConnectionConfirmed && (now - socket._lastConnectionConfirmed < 2000)) {
+        console.log(`🚫 [SERVER CIRCUIT BREAKER] Rapid connection-confirmed blocked for ${socket.user.name} (${now - socket._lastConnectionConfirmed}ms ago)`);
+        return;
+      }
+      
+      socket._connectionConfirmedCount++;
+      socket._lastConnectionConfirmed = now;
+      
+      socket.emit('connection-confirmed', connectionConfirmation);
     });
 
     // Error handling middleware
@@ -464,6 +532,9 @@ const startServer = async () => {
     // Graceful shutdown
     process.on('SIGTERM', async () => {
       console.log('SIGTERM received, shutting down gracefully');
+      
+      // Flush all pending batches before shutdown
+      await batchingManager.flushAll();
       
       // Close WebSocket connections
       io.close(() => {
@@ -477,6 +548,9 @@ const startServer = async () => {
     process.on('SIGINT', async () => {
       console.log('SIGINT received, shutting down gracefully');
       
+      // Flush all pending batches before shutdown
+      await batchingManager.flushAll();
+      
       // Close WebSocket connections
       io.close(() => {
         console.log('WebSocket server closed');
@@ -486,12 +560,29 @@ const startServer = async () => {
       process.exit(0);
     });
 
+    // Initialize client sync tracker for enhanced conflict detection
+    try {
+      await clientSyncTracker.initialize();
+      devLog('📊 Client sync tracker initialized');
+      
+      // Set up periodic cleanup (every 24 hours)
+      setInterval(async () => {
+        try {
+          await clientSyncTracker.cleanupOldEntries();
+        } catch (error) {
+          console.warn('⚠️ Client sync tracker cleanup failed:', error.message);
+        }
+      }, 24 * 60 * 60 * 1000);
+      
+    } catch (error) {
+      console.warn('⚠️ Client sync tracker initialization failed, continuing without it:', error.message);
+    }
+
     server.listen(PORT, () => {
-      console.log(`🚀 Server running on port ${PORT}`);
-      console.log(`🔡 WebSocket server enabled: ${process.env.WEBSOCKET_ENABLED === 'true'}`);
-      console.log(`🔄 Redis: ${redisClient ? 'Connected' : 'Disconnected'}`);
-      console.log(`🌐 CORS origins: ${corsOrigins.join(', ')}`);
-      console.log(`📧 Environment: ${process.env.NODE_ENV || 'development'}`);
+      console.log(`🚀 Server running on port ${PORT} (${process.env.NODE_ENV || 'development'})`);
+      devLog(`🔡 WebSocket server enabled: ${process.env.WEBSOCKET_ENABLED === 'true'}`);
+      devLog(`🔄 Redis: ${redisClient ? 'Connected' : 'Disconnected'}`);
+      devLog(`🌐 CORS origins: ${corsOrigins.join(', ')}`);
     });
 
   } catch (error) {

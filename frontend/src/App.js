@@ -1,4 +1,5 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
+import fastDiff from 'fast-diff';
 import { BrowserRouter as Router, Routes, Route, Navigate } from 'react-router-dom';
 import { 
   Box, 
@@ -39,7 +40,82 @@ import NoteEditor from './components/NoteEditor';
 import NotesList from './components/NotesList';
 import OfflineStatus from './components/OfflineStatus';
 import api from './utils/api';
-import websocketService from './services/websocketService';
+import offlineStorage from './utils/offlineStorage';
+import connectionController from './services/ConnectionController';
+import webSocketManager from './services/WebSocketManager';
+import { syncService } from './services/syncService';
+
+// Enhanced import testing for App.js diff utilities
+let appDiffSystemWorking = false;
+try {
+  // Test the diff functionality
+  const testOld = 'App Test Old';
+  const testNew = 'App Test New';
+  const testDiff = fastDiff(testOld, testNew);
+  
+  if (testDiff && Array.isArray(testDiff)) {
+    appDiffSystemWorking = true;
+    console.log('✅ [APP-DIFF] fast-diff library loaded and tested successfully in App.js');
+  } else {
+    console.error('❌ [APP-DIFF] fast-diff loaded but functionality test failed in App.js');
+  }
+} catch (error) {
+  console.error('❌ [APP-DIFF] Failed to load fast-diff library in App.js:', error);
+  console.log('📄 [APP-DIFF] App.js will use legacy full-content mode only');
+}
+
+// Development logging utility
+const isDevelopment = process.env.NODE_ENV === 'development';
+const devLog = (...args) => {
+  if (isDevelopment) {
+    console.log(...args);
+  }
+};
+
+// Diff utility functions for handling diff-based updates
+const applyContentDiff = (content, patches) => {
+  if (!patches || patches.length === 0) {
+    console.log('📦 [APP-DIFF] No patches to apply, returning original content');
+    return content;
+  }
+  
+  if (!appDiffSystemWorking) {
+    console.error('❌ [APP-DIFF] Diff system not working, cannot apply patches');
+    return content; // Return original content if diff system isn't working
+  }
+  
+  console.log('🔧 [APP-DIFF] Applying patches:', {
+    patchCount: patches.length,
+    originalLength: content.length,
+    diffSystemWorking: appDiffSystemWorking
+  });
+  
+  let result = content;
+  try {
+    // Apply patches in reverse order to maintain positions
+    for (let i = patches.length - 1; i >= 0; i--) {
+      const patch = patches[i];
+      if (patch.op === 'insert') {
+        result = result.slice(0, patch.pos) + patch.text + result.slice(patch.pos);
+        console.log(`➕ [APP-DIFF] Applied insert at ${patch.pos}: ${patch.text.substring(0, 20)}...`);
+      } else if (patch.op === 'delete') {
+        result = result.slice(0, patch.pos) + result.slice(patch.pos + patch.length);
+        console.log(`➖ [APP-DIFF] Applied delete at ${patch.pos}, length: ${patch.length}`);
+      }
+    }
+    
+    console.log('✅ [APP-DIFF] Successfully applied all patches:', {
+      resultLength: result.length,
+      changed: result !== content
+    });
+    
+  } catch (error) {
+    console.error('❌ [APP-DIFF] Error applying patches:', error);
+    return content; // Return original content on error
+  }
+  
+  return result;
+};
 
 function App() {
   const [user, setUser] = useState(null);
@@ -67,7 +143,14 @@ function App() {
   const [lastBulkSync, setLastBulkSync] = useState(null);
   const [appLifecycleStatus, setAppLifecycleStatus] = useState('active');
   
-  // WebSocket state
+  // Track currently opened note for bulk sync updates
+  const [currentlyOpenNoteId, setCurrentlyOpenNoteId] = useState(null);
+  
+  // Conflict resolution state
+  const [conflicts, setConflicts] = useState([]);
+  const [showConflictDialog, setShowConflictDialog] = useState(false);
+  
+  // WebSocket state - simplified
   const [websocketConnected, setWebsocketConnected] = useState(false);
   const [connectionMode, setConnectionMode] = useState('connecting'); // 'connecting', 'websocket', 'http', 'offline'
   const [realtimeActive, setRealtimeActive] = useState(false);
@@ -77,6 +160,17 @@ function App() {
   const [reconnectAttempts, setReconnectAttempts] = useState(0);
   const [lastActivityTime, setLastActivityTime] = useState(Date.now());
   
+  // Rate limiting for polling start
+  const [lastPollingStart, setLastPollingStart] = useState(0);
+  
+  // HTTP fallback timeout management
+  const httpFallbackTimeoutRef = useRef(null);
+  
+  // Request deduplication
+  const loadNotesInProgressRef = useRef(false);
+  const syncInProgressRef = useRef(false);
+  const lastApiOnlineEventRef = useRef(0);
+  
   // Responsive breakpoints
   const theme = useTheme();
   const isMobile = useMediaQuery(theme.breakpoints.down('md'), {
@@ -85,247 +179,215 @@ function App() {
   });
   const isTablet = useMediaQuery(theme.breakpoints.between('md', 'lg'));
 
-  // ===== WEBSOCKET INTEGRATION =====
+  // ===== SIMPLIFIED WEBSOCKET INTEGRATION =====
   
-  // Initialize WebSocket connection
-  const initializeWebSocket = async () => {
-    if (!user) {
-      console.log('⚠️ No user available for WebSocket initialization');
-      return;
-    }
-
-    try {
-      const token = localStorage.getItem('token');
-      if (!token) {
-        console.warn('⚠️ No auth token available for WebSocket');
-        setConnectionMode('http');
-        return;
+  // Setup WebSocket state sync from ConnectionController
+  const setupConnectionControllerListeners = () => {
+    let lastState = null;
+    
+    // Listen to ConnectionController state changes to update our UI
+    const checkConnectionState = () => {
+      const state = connectionController.getState();
+      const wsState = state.webSocket;
+      
+      // Only update if state actually changed to prevent thrashing
+      const currentStateKey = `${wsState.connected}-${state.isOnline}-${wsState.state}`;
+      if (lastState === currentStateKey) {
+        return; // No change, skip update
       }
-
-      console.log('🔌 Initializing WebSocket connection...');
-      setConnectionMode('connecting');
+      lastState = currentStateKey;
       
-      await websocketService.connect(token);
+      devLog('🔄 Connection state changed:', {
+        wsConnected: wsState.connected,
+        online: state.isOnline,
+        wsState: wsState.state
+      });
+
+      setWebsocketConnected(wsState.connected);
+      setRealtimeActive(wsState.connected);
       
-      setWebsocketConnected(true);
-      setConnectionMode('websocket');
-      console.log('✅ WebSocket connected successfully');
-      
-      // Stop HTTP polling since we have WebSocket
-      stopHttpPolling();
-      
-    } catch (error) {
-      console.error('❌ WebSocket initialization failed:', error);
-      setWebsocketConnected(false);
-      setConnectionMode('http');
-      
-      // Fall back to HTTP polling
-      console.log('🔄 Falling back to HTTP polling');
-      startHttpPolling();
-    }
-  };
-
-  // Setup WebSocket connection event listeners (non-state dependent)
-  const setupWebSocketConnectionListeners = () => {
-    if (!websocketService) return;
-
-    // Connection events
-    websocketService.on('connection-restored', () => {
-      console.log('🔌 WebSocket connection restored');
-      setWebsocketConnected(true);
-      setConnectionMode('websocket');
-      setReconnectAttempts(0);
-      stopHttpPolling();
-    });
-
-    websocketService.on('connection-lost', () => {
-      console.log('🔌 WebSocket connection lost');
-      setWebsocketConnected(false);
-      setConnectionMode('http');
-      setRealtimeActive(false);
-      
-      // Fall back to HTTP polling
-      startHttpPolling();
-    });
-
-    websocketService.on('connection-failed', () => {
-      console.log('❌ WebSocket connection failed permanently');
-      setWebsocketConnected(false);
-      setConnectionMode('http');
-      setRealtimeActive(false);
-      
-      // Fall back to HTTP polling
-      startHttpPolling();
-    });
-
-    // Handle connection confirmation
-    websocketService.on('connection-confirmed', (data) => {
-      console.log('✅ WebSocket connection confirmed:', data.user.name);
-      setRealtimeActive(true);
-    });
-
-    websocketService.on('bulk-sync-response', (data) => {
-      console.log('📱 Bulk sync response received:', data);
-      // Handle bulk sync response if needed
-    });
-
-    websocketService.on('websocket-error', (error) => {
-      console.error('❌ WebSocket error:', error);
-      setConnectionMode('http');
-    });
-  };
-
-  // Enhanced reconnectWebSocket function with better error handling
-const reconnectWebSocket = async () => {
-  // Check connectivity first
-  if (!isOnline) {
-    console.log('⚠️ Cannot reconnect WebSocket - offline');
-    setConnectionMode('offline');
-    return;
-  }
-
-  // Validate token before attempting connection
-  const token = localStorage.getItem('token');
-  if (!token) {
-    console.log('❌ No auth token available for WebSocket connection');
-    setConnectionMode('http');
-    startHttpPolling();
-    return;
-  }
-
-  // Validate token format and expiration
-  try {
-    const payload = JSON.parse(atob(token.split('.')[1]));
-    const now = Date.now() / 1000;
-    
-    if (payload.exp && payload.exp < now) {
-      console.log('❌ Token expired, cannot reconnect WebSocket');
-      await handleAuthFailure();
-      return;
-    }
-    
-    if (!payload.id) {
-      console.log('❌ Invalid token: missing user ID');
-      await handleAuthFailure();
-      return;
-    }
-  } catch (error) {
-    console.error('❌ Token validation failed:', error);
-    await handleAuthFailure();
-    return;
-  }
-
-  // Ensure user session is available
-  if (!user) {
-    console.log('🔄 Restoring user session before WebSocket connection...');
-    
-    try {
-      api.api.defaults.headers.common['Authorization'] = `Bearer ${token}`;
-      const userData = await api.getCurrentUser();
-      
-      if (!userData) {
-        console.log('❌ Could not restore user session');
-        await handleAuthFailure();
-        return;
-      }
-      
-      console.log('✅ User session restored for WebSocket:', userData.email);
-      setUser(userData);
-    } catch (error) {
-      console.error('❌ Failed to restore user session for WebSocket:', error);
-      if (error.response?.status === 401) {
-        await handleAuthFailure();
-      } else {
+      if (wsState.connected) {
+        setConnectionMode('websocket');
+        stopHttpPolling();
+        // Clear any lingering connection error messages when WebSocket is connected
+        setErrorMessage('');
+      } else if (state.isOnline) {
         setConnectionMode('http');
+        // Also clear error messages when back online via HTTP
+        setErrorMessage('');
         startHttpPolling();
+      } else {
+        setConnectionMode('offline');
+        stopHttpPolling();
       }
-      return;
-    }
-  }
-
-  try {
-    console.log('🔄 Attempting WebSocket reconnection...');
-    setConnectionMode('connecting');
-    setReconnectAttempts(prev => prev + 1);
+    };
     
-    // Clean disconnect first
-    if (websocketService) {
-      websocketService.disconnect();
-    }
-    
-    // Wait for clean disconnection
-    await new Promise(resolve => setTimeout(resolve, 1000));
-
-    console.log('🔌 Connecting WebSocket with validated token...');
-    await websocketService.connect(token);
-    
-    setWebsocketConnected(true);
-    setConnectionMode('websocket');
-    setReconnectAttempts(0);
-    
-    console.log('✅ WebSocket reconnected successfully');
-    
-    // Stop HTTP polling since we have WebSocket
-    stopHttpPolling();
-    
-    // Rejoin note collaboration if needed
-    if (selectedNote) {
-      console.log('🤝 Rejoining note collaboration after reconnect');
-      setTimeout(() => {
-        websocketService.joinNote(selectedNote.id);
-      }, 500);
-    }
-    
-  } catch (error) {
-    console.error('❌ WebSocket reconnection failed:', error);
-    setWebsocketConnected(false);
-    
-    // Handle specific error types
-    if (error.message?.includes('Token expired') || error.message?.includes('Authentication failed')) {
-      console.log('❌ Authentication failed, clearing session');
-      await handleAuthFailure();
-      return;
-    }
-    
-    setConnectionMode('http');
-    console.log('🔄 Falling back to HTTP polling after WebSocket failure');
-    startHttpPolling();
-    
-    // Retry with exponential backoff (max 3 attempts)
-    if (reconnectAttempts < 3 && isOnline) {
-      const delay = Math.min(5000 * Math.pow(2, reconnectAttempts), 30000);
-      console.log(`🔄 Will retry WebSocket in ${delay/1000}s (attempt ${reconnectAttempts + 1}/3)`);
+    // Listen to WebSocket events for immediate state updates
+    webSocketManager.on('connected', () => {
+      devLog('🔥 WebSocket connected');
+      checkConnectionState(); // Update immediately
       
-      setTimeout(() => {
-        if (isOnline && !websocketConnected) {
-          reconnectWebSocket();
+      // Clear any connection error messages immediately when WebSocket connects
+      setErrorMessage('');
+      
+      // CRITICAL: Trigger bulk sync when WebSocket reconnects to catch up on missed changes
+      setTimeout(async () => {
+        try {
+          devLog('🔄 WebSocket reconnected - triggering bulk sync to catch up on missed changes');
+          await loadNotes(true); // Force bulk sync to bypass duplicate prevention
+        } catch (error) {
+          console.error('Failed to sync after WebSocket reconnection:', error);
         }
-      }, delay);
-    } else {
-      console.log('❌ Max WebSocket reconnection attempts reached or offline');
-    }
-  }
-};
+      }, 1000);
+    });
+    
+    webSocketManager.on('disconnected', () => {
+      devLog('🔥 WebSocket disconnected');
+      checkConnectionState(); // Update immediately
+    });
+    
+    // Still poll periodically as backup, but less frequently
+    const stateCheckInterval = setInterval(checkConnectionState, 5000); // Every 5 seconds as backup
+    
+    // Also check immediately on setup
+    checkConnectionState();
+    
+    return () => {
+      clearInterval(stateCheckInterval);
+      webSocketManager.off('connected', checkConnectionState);
+      webSocketManager.off('disconnected', checkConnectionState);
+    };
+  };
+
+  // Simplified WebSocket event listeners
+  const setupWebSocketEventListeners = () => {
+    // Real-time note updates
+    webSocketManager.on('note-updated', (data) => {
+      devLog('📝 Real-time note update received:', data.noteId);
+      
+      // Ignore updates from the same connection to prevent echo
+      const currentConnectionId = webSocketManager.getConnectionId();
+      if (data.connectionId && data.connectionId === currentConnectionId) {
+        devLog('🔄 Ignoring update from same connection to prevent boomerang conflicts');
+        return;
+      }
+      
+      let updatedNote = null;
+      
+      // Small delay to allow manual saves to complete first and avoid race conditions
+      setTimeout(() => {
+        // Update the specific note in our notes array
+        setNotes(prevNotes => {
+          return prevNotes.map(note => {
+            if (note.id === data.noteId) {
+              // Handle diff-based vs full content updates
+              let newContent = note.content;
+              
+              if (data.updates.contentDiff) {
+                try {
+                  newContent = applyContentDiff(note.content, data.updates.contentDiff);
+                  devLog('📦 [APP] Applied content diff to notes array:', {
+                    patchCount: data.updates.contentDiff.length,
+                    originalLength: note.content.length,
+                    resultLength: newContent.length
+                  });
+                } catch (error) {
+                  console.error('❌ [APP] Failed to apply content diff to notes array:', error);
+                  // Fallback to existing content if diff fails
+                  newContent = note.content;
+                }
+              } else if (data.updates.content !== undefined) {
+                newContent = data.updates.content;
+                devLog('📄 [APP] Full content update to notes array (legacy mode)');
+              }
+              
+              updatedNote = {
+                ...note,
+                title: data.updates.title !== undefined ? data.updates.title : note.title,
+                content: newContent,
+                updatedAt: data.timestamp || data.updatedAt,
+                lastEditedBy: data.editor?.id,
+                lastEditorName: data.editor?.name,
+                lastEditorAvatar: data.editor?.avatar
+              };
+              return updatedNote;
+            }
+            return note;
+          });
+        });
+        
+        // Update selectedNote if it's the one being updated
+        setSelectedNote(currentSelectedNote => {
+          if (currentSelectedNote && currentSelectedNote.id === data.noteId && updatedNote) {
+            return updatedNote;
+          }
+          return currentSelectedNote;
+        });
+        
+        // Update timestamps
+        setNotesTimestamps(prev => {
+          const updated = new Map(prev);
+          updated.set(data.noteId, new Date(data.timestamp || data.updatedAt).getTime());
+          return updated;
+        });
+
+        // CRITICAL: Update offline cache with server data to maintain sync consistency
+        if (updatedNote && user?.id) {
+          offlineStorage.storeNote(updatedNote, user.id, { fromServer: true })
+            .catch(error => {
+              console.error(`Failed to update cache for real-time note ${data.noteId}:`, error);
+            });
+        }
+      }, 100); // 100ms delay to avoid race conditions
+    });
+
+    // Presence changes
+    webSocketManager.on('presence-changed', (data) => {
+      // Handle presence updates if needed
+    });
+
+    // Join note success
+    webSocketManager.on('join-note-success', (data) => {
+      // Note collaboration joined
+    });
+
+    // Bulk sync responses
+    webSocketManager.on('batch-saved', (data) => {
+      // The batch-saved event is handled in the NoteEditor component
+      // We don't need to update the notes array here as it causes feedback loops
+      // The NoteEditor already handles the batch save confirmation and updates its internal state
+    });
+  };
+
+  // Connection management is now handled entirely by ConnectionController
 
   // Start HTTP polling (fallback only)
   const startHttpPolling = () => {
     // Only start HTTP polling if WebSocket is not connected
     if (websocketConnected) {
-      console.log('⚠️ Skipping HTTP polling - WebSocket active');
       return;
     }
 
-    if (refreshIntervalId) {
-      console.log('🛑 Stopping existing HTTP polling before starting new one');
-      clearInterval(refreshIntervalId);
+    // Don't start if we're in websocket mode (even if websocketConnected is false temporarily)
+    if (connectionMode === 'websocket' || connectionMode === 'connecting') {
+      return;
     }
-    
-    console.log('🔄 Starting HTTP polling fallback (every 30 seconds)');
+
+    // Prevent multiple overlapping timers
+    if (refreshIntervalId) {
+      return;
+    }
+
+    // Rate limiting: don't start polling more than once every 5 seconds
+    const now = Date.now();
+    if (now - lastPollingStart < 5000) {
+      return;
+    }
+    setLastPollingStart(now);
     
     const intervalId = setInterval(() => {
       // Only poll if WebSocket is not connected
       if (!websocketConnected) {
-        console.log('⏰ HTTP polling interval triggered');
         checkForNoteUpdates(true);
       }
     }, 30000);
@@ -336,7 +398,6 @@ const reconnectWebSocket = async () => {
   // Stop HTTP polling
   const stopHttpPolling = () => {
     if (refreshIntervalId) {
-      console.log('🛑 Stopping HTTP polling');
       clearInterval(refreshIntervalId);
       setRefreshIntervalId(null);
     }
@@ -347,7 +408,6 @@ const reconnectWebSocket = async () => {
   const saveTemporaryNotesToStorage = (notes) => {
     const tempNotes = notes.filter(note => note.id.startsWith('temp_'));
     localStorage.setItem('tempNotes', JSON.stringify(tempNotes));
-    console.log('Saved temporary notes to localStorage:', tempNotes.length);
   };
 
   const loadTemporaryNotesFromStorage = () => {
@@ -355,7 +415,6 @@ const reconnectWebSocket = async () => {
       const saved = localStorage.getItem('tempNotes');
       if (saved) {
         const tempNotes = JSON.parse(saved);
-        console.log('Loaded temporary notes from localStorage:', tempNotes.length);
         return tempNotes;
       }
     } catch (error) {
@@ -371,7 +430,6 @@ const reconnectWebSocket = async () => {
         const tempNotes = JSON.parse(saved);
         const filtered = tempNotes.filter(note => note.id !== noteId);
         localStorage.setItem('tempNotes', JSON.stringify(filtered));
-        console.log('Removed temporary note from localStorage:', noteId);
       }
     } catch (error) {
       console.error('Failed to remove temporary note from localStorage:', error);
@@ -382,18 +440,14 @@ const reconnectWebSocket = async () => {
   const checkForNoteUpdates = async (silent = true) => {
     // Skip if WebSocket is handling updates
     if (websocketConnected) {
-      if (!silent) console.log('⚠️ Skipping HTTP update check - WebSocket active');
       return;
     }
 
     if (!user || !isOnline) {
-      if (!silent) console.log('📝 Skipping note updates check - user:', !!user, 'online:', isOnline);
       return;
     }
     
     try {
-      if (!silent) console.log('📝 Checking for note updates via HTTP...');
-      
       const response = await api.get('/api/notes');
       const serverNotes = response.data || [];
       
@@ -420,15 +474,6 @@ const reconnectWebSocket = async () => {
               hasBeenShared: note.hasBeenShared,
               lastEditor: note.lastEditorName || 'Unknown'
             });
-            console.log('🔄 Note updated detected via HTTP:', {
-              id: note.id,
-              title: note.title || 'Untitled',
-              shared: note.shared,
-              hasBeenShared: note.hasBeenShared,
-              oldTime: new Date(oldTime).toLocaleTimeString(),
-              newTime: new Date(newTime).toLocaleTimeString(),
-              lastEditor: note.lastEditorName || 'Unknown'
-            });
           }
         }
       });
@@ -437,10 +482,6 @@ const reconnectWebSocket = async () => {
       if (hasUpdates || notesTimestamps.size === 0) {
         setNotes(allNotes);
         setNotesTimestamps(newTimestamps);
-        
-        if (hasUpdates) {
-          console.log('✅ Applied HTTP updates to', updatedNotes.length, 'notes:', updatedNotes);
-        }
         
         // CRITICAL FIX: Update selected note if it was changed
         if (selectedNote) {
@@ -451,83 +492,91 @@ const reconnectWebSocket = async () => {
             
             // Update if timestamps differ OR if we don't have updatedAt on selected note
             if (updatedNoteTime !== selectedNoteTime || !selectedNote.updatedAt) {
-              console.log('🔄 Updating selected note via HTTP:', {
-                id: selectedNote.id,
-                title: selectedNote.title || 'Untitled',
-                oldTime: selectedNote.updatedAt,
-                newTime: updatedSelectedNote.updatedAt,
-                contentChanged: selectedNote.content !== updatedSelectedNote.content
-              });
               setSelectedNote(updatedSelectedNote);
             }
           }
         }
-        
-        if (hasUpdates && !silent) {
-          console.log('🔄 Notes updated from server via HTTP');
-        }
-      } else {
-        if (!silent) console.log('✅ No note updates detected via HTTP');
       }
       
     } catch (error) {
       if (!silent) {
-        console.error('❌ Failed to check for note updates via HTTP:', error);
+        console.error('Failed to check for note updates via HTTP:', error);
       }
     }
   };
 
   // Handle notes updated from WebSocket or bulk sync
-  const handleNotesUpdated = (updatedNotes) => {
-    console.log('🔥 Handling note updates from WebSocket/bulk sync:', updatedNotes.length);
+  const handleNotesUpdated = async (updatedNotes) => {
     
-    // DEBUG: Log what we're about to process
-    if (updatedNotes.length > 0) {
-      console.log('🔍 First updated note sample:', {
-        id: updatedNotes[0].id,
-        title: updatedNotes[0].title,
-        content: updatedNotes[0].content?.substring(0, 100) + '...',
-        updatedAt: updatedNotes[0].updatedAt
-      });
-    }
-    
-    // DEBUG: Log current selected note before update
-    if (selectedNote) {
-      console.log('🔍 Current selected note before update:', {
-        id: selectedNote.id,
-        title: selectedNote.title,
-        content: selectedNote.content?.substring(0, 100) + '...',
-        updatedAt: selectedNote.updatedAt
-      });
+    // CRITICAL: Apply conflict resolution for all updated notes
+    // This prevents race conditions where offline devices overwrite server changes
+    if (user && updatedNotes.length > 0) {
+      const notesToUpdate = [];
+      
+      try {
+        // Get current notes from state to compare against
+        const currentNotesMap = new Map(notes.map(n => [n.id, n]));
+        
+        for (const note of updatedNotes) {
+          const shouldDefer = await offlineStorage.shouldDeferToServer(note.id, note);
+          if (shouldDefer) {
+            // Check if this note is actually different from what we have in state
+            const currentNote = currentNotesMap.get(note.id);
+            const hasRealChanges = !currentNote || 
+              currentNote.title !== note.title ||
+              currentNote.content !== note.content ||
+              currentNote.updatedAt !== note.updatedAt;
+            
+            if (hasRealChanges) {
+              await offlineStorage.storeNote(note, user.id, { fromServer: true });
+              notesToUpdate.push(note);
+            } else {
+              // Still update the cache hash but don't trigger UI update
+              await offlineStorage.storeNote(note, user.id, { fromServer: true });
+            }
+          } else {
+            // Update original hash but don't overwrite local content
+            const cachedNote = await offlineStorage.getCachedNote(note.id);
+            if (cachedNote && note.contentHash) {
+              await offlineStorage.updateOriginalHashAfterSync(
+                note.id, 
+                note.contentHash, 
+                note.content, 
+                note.title
+              );
+            }
+          }
+        }
+        
+        // Only update React state for notes that were accepted from server
+        if (notesToUpdate.length > 0) {
+          updatedNotes = notesToUpdate;
+        } else {
+          updatedNotes = [];
+        }
+      } catch (error) {
+        console.error('❌ Failed to apply conflict resolution:', error);
+      }
     }
     
     // First, identify which note needs to be updated for selected note (BEFORE state update)
     const selectedNoteUpdate = selectedNote ? 
       updatedNotes.find(note => note.id === selectedNote.id) : null;
     
-    if (selectedNoteUpdate) {
-      console.log('📝 Selected note will be updated with:', {
-        selectedNoteId: selectedNote.id,
-        noteId: selectedNoteUpdate.id,
-        oldContent: selectedNote.content?.substring(0, 100) + '...',
-        newContent: selectedNoteUpdate.content?.substring(0, 100) + '...',
-        contentChanged: selectedNote.content !== selectedNoteUpdate.content
+    // Update the notes state with the new data
+    if (updatedNotes.length > 0) {
+      setNotes(prevNotes => {
+        const updatedNotesMap = new Map(updatedNotes.map(note => [note.id, note]));
+        
+        return prevNotes.map(note => {
+          const updated = updatedNotesMap.get(note.id);
+          if (updated) {
+            return updated;
+          }
+          return note;
+        });
       });
     }
-    
-    // Update the notes state with the new data
-    setNotes(prevNotes => {
-      const updatedNotesMap = new Map(updatedNotes.map(note => [note.id, note]));
-      
-      return prevNotes.map(note => {
-        const updated = updatedNotesMap.get(note.id);
-        if (updated) {
-          console.log(`🔄 Updating note ${note.id} in App state`);
-          return updated;
-        }
-        return note;
-      });
-    });
     
     // Update timestamps
     setNotesTimestamps(prev => {
@@ -540,51 +589,81 @@ const reconnectWebSocket = async () => {
       return updated;
     });
     
-    // CRITICAL FIX: Update selected note if it was affected (NOW WORKS!)
+    // CRITICAL FIX: Update selected note if it was affected
     if (selectedNoteUpdate) {
-      console.log('🔄 Updating selected note from bulk sync:', {
-        noteId: selectedNoteUpdate.id,
-        title: selectedNoteUpdate.title,
-        contentLength: selectedNoteUpdate.content?.length,
-        fullContent: selectedNoteUpdate.content?.substring(0, 200) + '...'
-      });
       setSelectedNote(selectedNoteUpdate);
-    } else {
-      console.log('⚠️ No selected note update found in bulk sync results:', {
-        selectedNoteId: selectedNote?.id,
-        updatedNotesCount: updatedNotes.length,
-        updatedNoteIds: updatedNotes.map(note => note.id),
-        firstUpdatedNote: updatedNotes[0]?.id
-      });
     }
     
     setLastBulkSync(new Date());
   };
 
-  // Modified loadNotes to also set up timestamps
-  const loadNotes = async () => {
+  // Enhanced loadNotes with proper conflict detection via syncService
+  const loadNotes = async (forceBulkSync = false) => {
+    // Prevent multiple parallel requests (unless forced for bulk sync)
+    if (loadNotesInProgressRef.current && !forceBulkSync) {
+      return;
+    }
+    
+    loadNotesInProgressRef.current = true;
     try {
+      // First get basic notes list
       const response = await api.get('/api/notes');
       const serverNotes = response.data || [];
       
-      console.log('📋 App.js loaded notes sample:', {
-        totalNotes: serverNotes.length,
-        firstNote: serverNotes[0] ? {
-          id: serverNotes[0].id,
-          title: serverNotes[0].title,
-          hasUpdatedAt: !!serverNotes[0].updatedAt,
-          updatedAt: serverNotes[0].updatedAt,
-          hasCreatedAt: !!serverNotes[0].createdAt,
-          createdAt: serverNotes[0].createdAt,
-          allKeys: Object.keys(serverNotes[0])
-        } : 'No notes'
-      });
+      // Set bulk sync flag to prevent race condition conflicts
+      setBulkSyncInProgress(true);
       
+      // Run intelligent bulk sync with conflict detection
+      const syncResult = await syncService.syncAllNotes(serverNotes, user);
+      
+      // Handle conflicts if any
+      if (syncResult.conflicts.length > 0) {
+        setConflicts(syncResult.conflicts);
+        setShowConflictDialog(true);
+      }
+      
+      // Apply non-conflicted updates
       const temporaryNotes = loadTemporaryNotesFromStorage();
-      const allNotes = [...temporaryNotes, ...serverNotes];
+      let allNotes = [...temporaryNotes, ...serverNotes];
+      
+      // Update notes with sync results (non-conflicted notes)
+      if (syncResult.updatedNotes.length > 0) {
+        
+        // Store updated notes in cache with server flag
+        for (const updatedNote of syncResult.updatedNotes) {
+          await offlineStorage.storeNote(updatedNote, user.id, { fromServer: true });
+        }
+        
+        // Update the notes array with sync results
+        const updatedNoteIds = new Set(syncResult.updatedNotes.map(note => note.id));
+        allNotes = allNotes.map(note => {
+          if (updatedNoteIds.has(note.id)) {
+            const updatedNote = syncResult.updatedNotes.find(u => u.id === note.id);
+            return updatedNote || note;
+          }
+          return note;
+        });
+      }
       
       setNotes(allNotes);
       setErrorMessage('');
+      
+      // Handle selected note updates (non-conflicted only)
+      if (selectedNote && syncResult.updatedNotes.length > 0) {
+        const updatedSelectedNote = syncResult.updatedNotes.find(note => note.id === selectedNote.id);
+        if (updatedSelectedNote) {
+          setSelectedNote(updatedSelectedNote);
+          
+          // Trigger direct editor update
+          if (window.noteEditorDirectUpdate) {
+            window.noteEditorDirectUpdate({
+              content: updatedSelectedNote.content,
+              title: updatedSelectedNote.title,
+              updatedAt: updatedSelectedNote.updatedAt
+            });
+          }
+        }
+      }
       
       // Set up timestamps for future comparison
       const timestamps = new Map();
@@ -595,58 +674,73 @@ const reconnectWebSocket = async () => {
       });
       setNotesTimestamps(timestamps);
       
-      console.log(`Loaded ${serverNotes.length} server notes and ${temporaryNotes.length} temporary notes`);
     } catch (error) {
-      console.error('Failed to load notes:', error);
+      console.error('Failed to load notes with sync:', error);
       
-      const temporaryNotes = loadTemporaryNotesFromStorage();
-      if (temporaryNotes.length > 0) {
-        setNotes(temporaryNotes);
-        console.log(`Loaded ${temporaryNotes.length} temporary notes from localStorage (server unavailable)`);
+      // Fallback to basic loading
+      try {
+        const response = await api.get('/api/notes');
+        const serverNotes = response.data || [];
+        const temporaryNotes = loadTemporaryNotesFromStorage();
+        const allNotes = [...temporaryNotes, ...serverNotes];
+        
+        setNotes(allNotes);
+      } catch (fallbackError) {
+        console.error('Fallback loading also failed:', fallbackError);
+        
+        const temporaryNotes = loadTemporaryNotesFromStorage();
+        if (temporaryNotes.length > 0) {
+          setNotes(temporaryNotes);
+        }
       }
       
-      if (!api.isNetworkError(error) && isOnline) {
+      // Show specific error messages for certain conditions
+      if (error.response?.status === 429) {
+        setErrorMessage('Server is busy (rate limited). Your notes will load when the limit resets.');
+      } else if (!api.isNetworkError(error) && isOnline) {
         setErrorMessage('Failed to load notes. Please try again.');
       }
+    } finally {
+      loadNotesInProgressRef.current = false;
+      setBulkSyncInProgress(false); // Clear bulk sync flag to re-enable conflict detection
     }
   };
 
   const syncTemporaryNotes = async () => {
-    console.log('Starting sync of temporary notes...');
+    // Prevent multiple parallel sync operations
+    if (syncInProgressRef.current) {
+      return;
+    }
+    
+    syncInProgressRef.current = true;
     
     const temporaryNotes = loadTemporaryNotesFromStorage();
     
     if (temporaryNotes.length === 0) {
-      console.log('No temporary notes to sync');
+      syncInProgressRef.current = false;
       return;
     }
     
-    console.log(`Syncing ${temporaryNotes.length} temporary notes...`);
     setSyncInProgress(true);
     
     for (const tempNote of temporaryNotes) {
       try {
-        console.log(`Syncing temporary note: ${tempNote.id}`, tempNote.title || 'Untitled');
-        
         const response = await api.post('/api/notes', {
           title: tempNote.title || '',
           content: tempNote.content || ''
         });
         
         const serverNote = response.data;
-        console.log(`Successfully created server note: ${serverNote.id}`);
         
         setNotes(prevNotes => {
           const updatedNotes = prevNotes.map(note => 
             note.id === tempNote.id ? serverNote : note
           );
-          console.log('Updated notes state after sync');
           return updatedNotes;
         });
         
         setSelectedNote(prevSelected => {
           if (prevSelected && prevSelected.id === tempNote.id) {
-            console.log('Updated selected note after sync');
             return serverNote;
           }
           return prevSelected;
@@ -661,7 +755,6 @@ const reconnectWebSocket = async () => {
         });
         
         removeTemporaryNoteFromStorage(tempNote.id);
-        console.log(`Successfully synced temporary note ${tempNote.id} -> ${serverNote.id}`);
         
       } catch (error) {
         console.error(`Failed to sync temporary note ${tempNote.id}:`, error);
@@ -669,320 +762,143 @@ const reconnectWebSocket = async () => {
     }
     
     setSyncInProgress(false);
-    console.log('Finished syncing temporary notes');
+    syncInProgressRef.current = false;
   };
 
-  // NEW: Enhanced setupOfflineListeners with standby/resume handling
-const setupOfflineListeners = () => {
-  const handleBrowserOnline = async () => {
-    console.log('🌐 Browser detected: online');
-    setIsOnline(true);
-    setRetryCount(0);
-    setErrorMessage('');
-    
-    // Add a small delay to ensure network is actually stable
-    setTimeout(async () => {
-      try {
-        console.log('🔄 Triggering sync after coming online...');
-        await syncTemporaryNotes();
-        await loadNotes();
-        
-        // FIXED: Only try to reconnect WebSocket if user is available
-        // Check user state at the time of reconnection, not when this function was defined
-        if (user) {
-          console.log('🔄 User available, attempting WebSocket reconnection...');
-          await reconnectWebSocket();
-        } else {
-          console.log('⚠️ User not available during online event, checking auth state...');
-          // If user is not available, try to restore auth first
-          const token = localStorage.getItem('token');
-          if (token) {
-            console.log('🔑 Token exists, attempting to restore user session...');
-            try {
-              api.api.defaults.headers.common['Authorization'] = `Bearer ${token}`;
-              const userData = await api.getCurrentUser();
-              if (userData) {
-                console.log('✅ User session restored, now attempting WebSocket...');
-                setUser(userData);
-                // Wait a bit for user state to update, then try WebSocket
-                setTimeout(() => {
-                  if (userData) { // Use the fresh userData, not state
-                    reconnectWebSocket();
-                  }
-                }, 1000);
-              } else {
-                console.log('❌ Could not restore user session');
-                setConnectionMode('http');
-                startHttpPolling();
-              }
-            } catch (error) {
-              console.error('❌ Failed to restore user session:', error);
-              setConnectionMode('http');
-              startHttpPolling();
-            }
-          } else {
-            console.log('❌ No token available, user needs to re-authenticate');
-            setConnectionMode('offline');
-          }
-        }
-      } catch (error) {
-        console.error('❌ Failed to sync after coming online:', error);
-      }
-    }, 1000);
-  };
-
-  const handleBrowserOffline = () => {
-    console.log('📱 Browser detected: offline');
-    setIsOnline(false);
-    setConnectionMode('offline');
-    setWebsocketConnected(false);
-    stopHttpPolling();
-    // DON'T clear user state here - keep it for when we come back online
-  };
-
-  // Enhanced visibility change handler with better state preservation
-  const handleVisibilityChange = async () => {
-    const currentTime = Date.now();
-    const wasHidden = appVisibility === 'hidden';
-    const isNowVisible = document.visibilityState === 'visible';
-    
-    setAppVisibility(document.visibilityState);
-    
-    console.log(`👁️ App visibility changed: ${document.visibilityState}`);
-    
-    if (wasHidden && isNowVisible) {
-      const timeSinceHidden = currentTime - lastActivityTime;
-      console.log(`📱 App resumed after ${Math.round(timeSinceHidden / 1000)}s`);
+  // Simplified offline listeners - let ConnectionController handle everything
+  const setupOfflineListeners = () => {
+    const handleBrowserOnline = async () => {
+      console.log('🌐 Browser detected: online');
+      setIsOnline(true);
+      setRetryCount(0);
+      setErrorMessage('');
       
-      // Update last activity time AFTER calculating the difference
-      setLastActivityTime(currentTime);
+      // Update ConnectionController online state - let it handle the connection
+      connectionController.setOnline(true, 'browser online event');
       
-      // If we were hidden for more than 30 seconds, assume connections were lost
-      if (timeSinceHidden > 30000) {
-        console.log('🔄 Long sleep detected, forcing reconnection...');
-        
-        // Reset connection state but preserve user state
-        setWebsocketConnected(false);
-        setConnectionMode('connecting');
-        
-        // Check actual connectivity first
+      // Just sync data - connection is handled by ConnectionController
+      setTimeout(async () => {
         try {
-          const response = await fetch('/health', { 
-            method: 'GET', 
-            cache: 'no-cache',
-            headers: { 'Cache-Control': 'no-cache' }
-          });
-          
-          if (response.ok) {
-            console.log('✅ Network connectivity confirmed after resume');
-            setIsOnline(true);
-            
-            // FIXED: Check user state before attempting reconnection
-            const currentUser = user; // Capture current user state
-            if (currentUser) {
-              console.log('🔄 User available after resume, reconnecting WebSocket...');
-              await reconnectWebSocket();
-            } else {
-              console.log('⚠️ User not available after resume, checking auth...');
-              // Try to restore user session
-              const token = localStorage.getItem('token');
-              if (token) {
-                try {
-                  api.api.defaults.headers.common['Authorization'] = `Bearer ${token}`;
-                  const userData = await api.getCurrentUser();
-                  if (userData) {
-                    console.log('✅ User session restored after resume');
-                    setUser(userData);
-                    setTimeout(() => reconnectWebSocket(), 1000);
-                  } else {
-                    console.log('❌ Could not restore user session after resume');
-                    setConnectionMode('http');
-                    startHttpPolling();
-                  }
-                } catch (error) {
-                  console.error('❌ Auth restoration failed after resume:', error);
-                  setConnectionMode('http');
-                  startHttpPolling();
-                }
-              } else {
-                console.log('❌ No token available after resume');
-                setConnectionMode('offline');
-              }
-            }
-          } else {
-            throw new Error('Health check failed');
-          }
+          await syncTemporaryNotes();
+          await loadNotes();
         } catch (error) {
-          console.log('❌ Network not available after resume');
-          setIsOnline(false);
-          setConnectionMode('offline');
-        }
-      } else if (!websocketConnected && isOnline) {
-        // Short sleep, just reconnect WebSocket if needed
-        console.log('🔄 Quick reconnection after short sleep...');
-        if (user) {
-          await reconnectWebSocket();
-        } else {
-          console.log('⚠️ User not available for quick reconnection, starting HTTP polling');
-          setConnectionMode('http');
-          startHttpPolling();
-        }
-      }
-    } else {
-      // Update last activity time when hiding
-      setLastActivityTime(currentTime);
-    }
-  };
-
-  // Page focus/blur handlers (additional layer)
-  const handleFocus = async () => {
-    console.log('🔍 Window focused');
-    setLastActivityTime(Date.now());
-    
-    // Quick connectivity check on focus
-    if (!websocketConnected && isOnline && user) {
-      console.log('🔄 Quick reconnection on window focus...');
-      setTimeout(() => reconnectWebSocket(), 500);
-    }
-  };
-
-  const handleBlur = () => {
-    console.log('😴 Window blurred');
-    setLastActivityTime(Date.now());
-  };
-
-  // Page freeze/resume handlers (iOS Safari specific)
-  const handleFreeze = () => {
-    console.log('🧊 Page frozen (iOS/mobile specific)');
-    setLastActivityTime(Date.now());
-  };
-
-  const handleResume = async () => {
-    console.log('🔥 Page resumed (iOS/mobile specific)');
-    const currentTime = Date.now();
-    const timeFrozen = currentTime - lastActivityTime;
-    
-    console.log(`📱 Page was frozen for ${Math.round(timeFrozen / 1000)}s`);
-    
-    if (timeFrozen > 10000) { // More than 10 seconds
-      console.log('🔄 Long freeze detected, forcing reconnection...');
-      setLastActivityTime(currentTime); // Update time before calling visibility logic
-      await handleVisibilityChange(); // Reuse the visibility logic
-    }
-  };
-
-  // Set up all event listeners
-  window.addEventListener('online', handleBrowserOnline);
-  window.addEventListener('offline', handleBrowserOffline);
-  window.addEventListener('focus', handleFocus);
-  window.addEventListener('blur', handleBlur);
-  document.addEventListener('visibilitychange', handleVisibilityChange);
-  
-  // iOS specific events
-  document.addEventListener('freeze', handleFreeze);
-  document.addEventListener('resume', handleResume);
-  
-  // Page lifecycle events
-  window.addEventListener('pageshow', (event) => {
-    if (event.persisted) {
-      console.log('📄 Page restored from cache');
-      setTimeout(() => {
-        if (user) {
-          reconnectWebSocket();
-        } else {
-          console.log('⚠️ User not available from cache restore');
+          console.error('❌ Failed to sync after coming online:', error);
         }
       }, 1000);
-    }
-  });
+    };
 
-  // Set initial states
-  setIsOnline(navigator.onLine);
-  setAppVisibility(document.visibilityState);
-  setLastActivityTime(Date.now()); // Initialize activity time
-  
-  if (!navigator.onLine) {
-    setConnectionMode('offline');
-  }
+    const handleBrowserOffline = () => {
+      console.log('📱 Browser detected: offline');
+      setIsOnline(false);
+      
+      // Update ConnectionController offline state - let it handle disconnection
+      connectionController.setOnline(false, 'browser offline event');
+    };
 
-  // API event listeners
-  api.addEventListener('online', async () => {
-    console.log('🔗 API detected: online');
-    setIsOnline(true);
-    setRetryCount(0);
-    setErrorMessage('');
-    
-    setTimeout(async () => {
-      try {
-        console.log('API online - triggering sync...');
-        await syncTemporaryNotes();
-        await loadNotes();
-        
-        // FIXED: Check user state before attempting WebSocket reconnection
-        if (user) {
-          console.log('🔗 User available, attempting WebSocket reconnection via API event...');
-          await reconnectWebSocket();
-        } else {
-          console.log('⚠️ User not available during API online event');
-          setConnectionMode('http');
-          startHttpPolling();
-        }
-      } catch (error) {
-        console.error('Failed to sync after API online:', error);
+    // Simplified visibility change handler
+    const handleVisibilityChange = () => {
+      setAppVisibility(document.visibilityState);
+      
+      if (document.visibilityState === 'visible') {
+        console.log('👁️ App became visible');
+        connectionController.onAppResume();
+      } else {
+        console.log('😴 App became hidden');
+        connectionController.onAppPause();
       }
-    }, 1000);
-  });
-  
-  api.addEventListener('offline', () => {
-    console.log('🔗 API detected: offline');
-    setIsOnline(false);
-    setConnectionMode('offline');
-    setWebsocketConnected(false);
-    stopHttpPolling();
-    // DON'T clear user state here
-  });
-  
-  api.addEventListener('sync-start', () => setSyncInProgress(true));
-  api.addEventListener('sync-complete', () => {
-    setSyncInProgress(false);
-    setRetryCount(0);
-    loadNotes();
-  });
-  
-  api.addEventListener('sync-error', (event) => {
-    setSyncInProgress(false);
-    const error = event.detail.error;
-    console.error('Sync error:', error);
-    
-    if (retryCount < maxRetries) {
-      setRetryCount(prev => prev + 1);
-      setTimeout(() => {
-        if (isOnline) {
-          api.forcSync();
-        }
-      }, 5000 * (retryCount + 1));
-    } else {
-      setErrorMessage('Failed to sync changes after multiple attempts. Your notes are saved locally and will sync when connection improves.');
-      setShowErrorDialog(true);
-    }
-  });
-  
-  api.addEventListener('offline-change', () => {
-    loadNotes();
-  });
+    };
 
-  // Cleanup function
-  return () => {
-    window.removeEventListener('online', handleBrowserOnline);
-    window.removeEventListener('offline', handleBrowserOffline);
-    window.removeEventListener('focus', handleFocus);
-    window.removeEventListener('blur', handleBlur);
-    document.removeEventListener('visibilitychange', handleVisibilityChange);
-    document.removeEventListener('freeze', handleFreeze);
-    document.removeEventListener('resume', handleResume);
-    stopHttpPolling();
+    // Simplified focus handlers
+    const handleFocus = () => {
+      console.log('🔍 Window focused');
+      connectionController.onAppResume();
+    };
+
+    const handleBlur = () => {
+      console.log('😴 Window blurred');
+      connectionController.onAppPause();
+    };
+
+    // Set up event listeners
+    window.addEventListener('online', handleBrowserOnline);
+    window.addEventListener('offline', handleBrowserOffline);
+    window.addEventListener('focus', handleFocus);
+    window.addEventListener('blur', handleBlur);
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+
+    // Set initial states
+    setIsOnline(navigator.onLine);
+    setAppVisibility(document.visibilityState);
+    
+    // Initialize ConnectionController online state
+    connectionController.setOnline(navigator.onLine, 'initial setup');
+
+    // API event listeners - simplified
+    api.addEventListener('online', async () => {
+      console.log('🔗 API detected: online');
+      setIsOnline(true);
+      setRetryCount(0);
+      setErrorMessage('');
+      
+      connectionController.setOnline(true, 'API online event');
+      
+      setTimeout(async () => {
+        try {
+          await syncTemporaryNotes();
+          await loadNotes();
+        } catch (error) {
+          console.error('Failed to sync after API online:', error);
+        }
+      }, 1000);
+    });
+    
+    api.addEventListener('offline', () => {
+      console.log('🔗 API detected: offline');
+      setIsOnline(false);
+      
+      connectionController.setOnline(false, 'API offline event');
+    });
+    
+    api.addEventListener('sync-start', () => setSyncInProgress(true));
+    api.addEventListener('sync-complete', () => {
+      setSyncInProgress(false);
+      setRetryCount(0);
+      setErrorMessage(''); // Clear any sync-related error messages on successful sync
+      loadNotes();
+    });
+    
+    api.addEventListener('sync-error', (event) => {
+      setSyncInProgress(false);
+      const error = event.detail.error;
+      console.error('Sync error:', error);
+      
+      if (retryCount < maxRetries) {
+        setRetryCount(prev => prev + 1);
+        setTimeout(() => {
+          if (isOnline) {
+            api.forcSync();
+          }
+        }, 5000 * (retryCount + 1));
+      } else {
+        setErrorMessage('Failed to sync changes after multiple attempts. Your notes are saved locally and will sync when connection improves.');
+        setShowErrorDialog(true);
+      }
+    });
+    
+    api.addEventListener('offline-change', () => {
+      loadNotes();
+    });
+
+    // Cleanup function
+    return () => {
+      window.removeEventListener('online', handleBrowserOnline);
+      window.removeEventListener('offline', handleBrowserOffline);
+      window.removeEventListener('focus', handleFocus);
+      window.removeEventListener('blur', handleBlur);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      stopHttpPolling();
+    };
   };
-};
 
 // STOP
 // STOP
@@ -1076,6 +992,39 @@ const setupOfflineListeners = () => {
 
   const updateNote = async (id, updates) => {
     try {
+      // Check if this is a WebSocket save confirmation (not a new save request)
+      const isWebSocketSaveConfirmation = updates._isWebSocketSaveConfirmation;
+      if (isWebSocketSaveConfirmation) {
+        console.log(`🔄 Processing WebSocket save confirmation for note ${id}`);
+        
+        // Clean the updates object
+        const cleanUpdates = { ...updates };
+        delete cleanUpdates._isWebSocketSaveConfirmation;
+        
+        // Update notes array and selectedNote with the confirmed save data
+        setNotes(prevNotes => {
+          console.log(`🔄 WebSocket save confirmation updating note ${id} in notes list with timestamp:`, cleanUpdates.updatedAt);
+          return prevNotes.map(note => note.id === id ? { ...note, ...cleanUpdates, offline: false, pendingSync: false } : note);
+        });
+        
+        if (selectedNote && selectedNote.id === id) {
+          setSelectedNote(prev => {
+            console.log(`🔄 WebSocket save confirmation updating selected note ${id} with timestamp:`, cleanUpdates.updatedAt);
+            return { ...prev, ...cleanUpdates, offline: false, pendingSync: false };
+          });
+        }
+        
+        // Update timestamps
+        setNotesTimestamps(prev => {
+          const updated = new Map(prev);
+          updated.set(id, new Date(cleanUpdates.updatedAt).getTime());
+          console.log(`🕒 WebSocket save confirmation updated timestamp for note ${id}:`, new Date(cleanUpdates.updatedAt).toLocaleString());
+          return updated;
+        });
+        
+        return; // Don't proceed with server save - this is just a confirmation
+      }
+      
       const isTemporaryNote = id.startsWith('temp_');
       
       if (isTemporaryNote) {
@@ -1087,29 +1036,73 @@ const setupOfflineListeners = () => {
           pendingSync: true
         };
         
-        const newNotes = notes.map(note => note.id === id ? updatedNote : note);
-        setNotes(newNotes);
+        setNotes(prevNotes => {
+          console.log(`🔄 Temp note update for note ${id} in notes list with timestamp:`, updatedNote.updatedAt);
+          const newNotes = prevNotes.map(note => note.id === id ? updatedNote : note);
+          saveTemporaryNotesToStorage(newNotes);
+          return newNotes;
+        });
+        
         if (selectedNote && selectedNote.id === id) {
           setSelectedNote(updatedNote);
+          console.log(`🔄 Temp note update for selected note ${id} with timestamp:`, updatedNote.updatedAt);
         }
-        
-        saveTemporaryNotesToStorage(newNotes);
         
         console.log('Updated temporary note locally:', id);
         return;
       }
       
+      // CRITICAL: Update cache BEFORE server save to preserve changes if network fails
+      if (user?.id) {
+        const currentNote = notes.find(note => note.id === id);
+        if (currentNote) {
+          const updatedNoteForCache = {
+            ...currentNote,
+            ...updates,
+            updatedAt: new Date().toISOString(), // Temporary timestamp, will be replaced by server response
+          };
+          
+          try {
+            await offlineStorage.storeNote(updatedNoteForCache, user.id);
+            console.log(`💾 Cache updated BEFORE server save for note ${id}`);
+          } catch (cacheError) {
+            console.error(`❌ Failed to update cache before save for note ${id}:`, cacheError);
+            // Continue with server save even if cache fails
+          }
+        }
+      }
+      
       const response = await api.put(`/api/notes/${id}`, updates);
       const updatedNote = response.data;
-      setNotes(notes.map(note => note.id === id ? updatedNote : note));
+      
+      // CRITICAL: Update cache AFTER successful server save with final server data
+      if (user?.id) {
+        try {
+          await offlineStorage.storeNote(updatedNote, user.id, { fromServer: true });
+          console.log(`💾 Cache updated AFTER successful server save for note ${id}`);
+        } catch (cacheError) {
+          console.error(`❌ Failed to update cache after server save for note ${id}:`, cacheError);
+        }
+      }
+      
+      // Use functional update to ensure we're working with latest state
+      // Update notes list and selected note simultaneously to prevent sync issues
+      setNotes(prevNotes => {
+        console.log(`🔄 Manual save updating note ${id} in notes list with timestamp:`, updatedNote.updatedAt);
+        return prevNotes.map(note => note.id === id ? updatedNote : note);
+      });
+      
+      // Update selected note immediately after notes array
       if (selectedNote && selectedNote.id === id) {
         setSelectedNote(updatedNote);
+        console.log(`🔄 Manual save updating selected note ${id} with timestamp:`, updatedNote.updatedAt);
       }
       
       // Update timestamps
       setNotesTimestamps(prev => {
         const updated = new Map(prev);
         updated.set(updatedNote.id, new Date(updatedNote.updatedAt).getTime());
+        console.log(`🕒 Manual save updated timestamp for note ${id}:`, new Date(updatedNote.updatedAt).toLocaleString());
         return updated;
       });
       
@@ -1126,14 +1119,22 @@ const setupOfflineListeners = () => {
           pendingSync: true
         };
         
-        const newNotes = notes.map(note => note.id === id ? updatedNote : note);
-        setNotes(newNotes);
+        setNotes(prevNotes => {
+          console.log(`🔄 Network error save updating note ${id} in notes list with timestamp:`, updatedNote.updatedAt);
+          return prevNotes.map(note => note.id === id ? updatedNote : note);
+        });
+        
         if (selectedNote && selectedNote.id === id) {
           setSelectedNote(updatedNote);
+          console.log(`🔄 Network error save updating selected note ${id} with timestamp:`, updatedNote.updatedAt);
         }
         
         if (id.startsWith('temp_')) {
-          saveTemporaryNotesToStorage(newNotes);
+          // Re-fetch notes for temp note storage after state update
+          setTimeout(() => {
+            const currentNotes = notes.map(note => note.id === id ? updatedNote : note);
+            saveTemporaryNotesToStorage(currentNotes);
+          }, 0);
         }
         
         console.log('Updated note locally due to network error:', id);
@@ -1197,104 +1198,55 @@ const setupOfflineListeners = () => {
     setupPWAListeners();
     
     const cleanupOfflineListeners = setupOfflineListeners();
+    const cleanupConnectionController = setupConnectionControllerListeners();
     
     return () => {
       if (cleanupOfflineListeners) {
         cleanupOfflineListeners();
       }
+      if (cleanupConnectionController) {
+        cleanupConnectionController();
+      }
       stopHttpPolling();
       
-      // Cleanup WebSocket
-      if (websocketService) {
-        websocketService.disconnect();
+      // Clear HTTP fallback timeout
+      if (httpFallbackTimeoutRef.current) {
+        clearTimeout(httpFallbackTimeoutRef.current);
+        httpFallbackTimeoutRef.current = null;
       }
+      
+      // Cleanup WebSocket
+      webSocketManager.disconnect();
     };
   }, []);
 
-  // Setup WebSocket when user is authenticated
+  // Setup ConnectionController when user changes
   useEffect(() => {
     if (user) {
-      console.log('🔌 User authenticated, setting up WebSocket...');
-      setupWebSocketConnectionListeners();
-      initializeWebSocket();
+      console.log('🔌 User authenticated, setting up ConnectionController...');
+      
+      // Setup WebSocket event listeners once
+      setupWebSocketEventListeners();
+      
+      // Always update ConnectionController, but don't disconnect/reconnect if already connected
+      const token = localStorage.getItem('token');
+      const currentState = connectionController.getState();
+      
+      if (!currentState.hasUser || user.isMinimal) {
+        // First time setting user or upgrading from minimal user
+        console.log('🔄 Setting/upgrading user in ConnectionController');
+        connectionController.setUser(user, token);
+        connectionController.setOnline(navigator.onLine, 'user authenticated');
+      } else {
+        console.log('🔄 User already connected, maintaining connection');
+      }
+    } else {
+      // Clear user from ConnectionController
+      connectionController.setUser(null, null);
     }
   }, [user]);
   
-  // Setup WebSocket real-time note update listeners (depends on selectedNote)
-  useEffect(() => {
-    if (!websocketService) return;
-    
-    console.log('🔧 Setting up WebSocket note-updated handler for selectedNote:', selectedNote?.id);
-    
-    const handleNoteUpdated = (data) => {
-      console.log('📝 [NEW HANDLER] Real-time note update received in App.js:', data.noteId);
-      
-      let updatedNote = null;
-      
-      // Update the specific note in our notes array
-      setNotes(prevNotes => {
-        return prevNotes.map(note => {
-          if (note.id === data.noteId) {
-            updatedNote = {
-              ...note,
-              title: data.updates.title !== undefined ? data.updates.title : note.title,
-              content: data.updates.content !== undefined ? data.updates.content : note.content,
-              updatedAt: data.timestamp || data.updatedAt,
-              lastEditedBy: data.editor?.id,
-              lastEditorName: data.editor?.name,
-              lastEditorAvatar: data.editor?.avatar
-            };
-            return updatedNote;
-          }
-          return note;
-        });
-      });
-      
-      // CRITICAL FIX: Update selectedNote if it's the note being updated
-      // This now has access to the current selectedNote state
-      if (selectedNote && selectedNote.id === data.noteId && updatedNote) {
-        console.log('🔄 [SUCCESS] Updating selectedNote with real-time changes:', {
-          noteId: data.noteId,
-          selectedNoteId: selectedNote.id,
-          oldContent: selectedNote.content?.substring(0, 50) + '...',
-          newContent: updatedNote.content?.substring(0, 50) + '...'
-        });
-        setSelectedNote(updatedNote);
-      } else {
-        console.log('⚠️ [FAILED] Real-time update not applied to selectedNote:', {
-          hasSelectedNote: !!selectedNote,
-          selectedNoteId: selectedNote?.id,
-          updateNoteId: data.noteId,
-          hasUpdatedNote: !!updatedNote,
-          idsMatch: selectedNote?.id === data.noteId
-        });
-      }
-      
-      // Update timestamps
-      setNotesTimestamps(prev => {
-        const updated = new Map(prev);
-        updated.set(data.noteId, new Date(data.timestamp || data.updatedAt).getTime());
-        return updated;
-      });
-    };
-    
-    // Add the handler (don't remove old ones for now to avoid breaking existing functionality)
-    websocketService.on('note-updated', handleNoteUpdated);
-    console.log('✅ WebSocket note-updated handler registered');
-    
-    // Cleanup function
-    return () => {
-      console.log('🧧 Cleaning up WebSocket note-updated handler');
-      try {
-        if (websocketService && websocketService.off) {
-          websocketService.off('note-updated', handleNoteUpdated);
-        }
-      } catch (error) {
-        console.warn('⚠️ Error removing WebSocket handler:', error);
-      }
-    };
-    
-  }, [selectedNote]); // Re-run when selectedNote changes
+  // Note: WebSocket event listeners are now set up in setupWebSocketEventListeners()
 
   // Event handlers
   const handleNoteSelect = async (note) => {
@@ -1387,8 +1339,9 @@ const setupOfflineListeners = () => {
       }
 
       // Validate token format and expiration before making API calls
+      let payload;
       try {
-        const payload = JSON.parse(atob(token.split('.')[1]));
+        payload = JSON.parse(atob(token.split('.')[1]));
         const now = Date.now() / 1000;
         
         if (payload.exp && payload.exp < now) {
@@ -1415,6 +1368,8 @@ const setupOfflineListeners = () => {
       if (userData) {
         console.log('✅ User authenticated successfully:', userData.email);
         setUser(userData);
+        
+        // WebSocket connection handled by ConnectionController after user is set
         await loadNotes();
         
         // WebSocket initialization happens in useEffect when user is set
@@ -1478,9 +1433,7 @@ const setupOfflineListeners = () => {
     
     // Stop all connection attempts
     stopHttpPolling();
-    if (websocketService) {
-      websocketService.disconnect();
-    }
+    webSocketManager.disconnect();
     
     // Reset connection state
     setWebsocketConnected(false);
@@ -1513,9 +1466,7 @@ const setupOfflineListeners = () => {
     }
     
     stopHttpPolling();
-    if (websocketService) {
-      websocketService.disconnect();
-    }
+    webSocketManager.disconnect();
     setWebsocketConnected(false);
     setConnectionMode('offline');
     localStorage.removeItem('token');
@@ -1576,7 +1527,7 @@ const setupOfflineListeners = () => {
   const getConnectionStatusLabel = () => {
     if (syncInProgress) return 'Syncing...';
     switch (connectionMode) {
-      case 'websocket': return 'Real-time';
+      case 'websocket': return 'Connected';
       case 'http': return 'HTTP sync';
       case 'offline': return 'Offline';
       case 'connecting': return 'Connecting...';
@@ -1672,22 +1623,6 @@ const setupOfflineListeners = () => {
                   }}
                 >
                   PWA
-                </Typography>
-              )}
-              {connectionMode === 'websocket' && (
-                <Typography 
-                  component="span" 
-                  variant="caption" 
-                  sx={{ 
-                    ml: 1, 
-                    px: 1, 
-                    py: 0.5, 
-                    backgroundColor: 'rgba(255,255,255,0.15)', 
-                    borderRadius: 1,
-                    fontSize: '0.65rem'
-                  }}
-                >
-                  ⚡ Real-time
                 </Typography>
               )}
             </Typography>
@@ -1826,6 +1761,7 @@ const setupOfflineListeners = () => {
                 onNotesUpdated={handleNotesUpdated}
                 websocketConnected={websocketConnected}
                 connectionMode={connectionMode}
+                bulkSyncInProgress={bulkSyncInProgress}
               />
             </Box>
           )}
@@ -1887,6 +1823,82 @@ const setupOfflineListeners = () => {
           </Button>
           <Button onClick={handleRetry} variant="contained">
             Retry
+          </Button>
+        </DialogActions>
+      </Dialog>
+      
+      {/* Conflict Resolution Dialog */}
+      <Dialog 
+        open={showConflictDialog} 
+        onClose={() => setShowConflictDialog(false)}
+        maxWidth="md"
+        fullWidth
+      >
+        <DialogTitle>
+          <Box display="flex" alignItems="center" gap={1}>
+            <WarningIcon color="warning" />
+            Sync Conflict Detected
+          </Box>
+        </DialogTitle>
+        <DialogContent>
+          {conflicts.length > 0 && (
+            <>
+              <Typography variant="body1" gutterBottom>
+                Changes were made to the same note on different devices. Please choose which version to keep:
+              </Typography>
+              {conflicts.map((conflict, index) => (
+                <Box key={conflict.noteId} sx={{ mt: 2, p: 2, border: '1px solid #ddd', borderRadius: 1 }}>
+                  <Typography variant="h6" gutterBottom>
+                    Note: {conflict.serverTitle || 'Untitled'}
+                  </Typography>
+                  <Box sx={{ display: 'flex', gap: 2, mt: 2 }}>
+                    <Box sx={{ flex: 1 }}>
+                      <Typography variant="subtitle2" color="primary">Local Version</Typography>
+                      <Typography variant="body2" sx={{ 
+                        maxHeight: 100, 
+                        overflow: 'auto', 
+                        p: 1, 
+                        bgcolor: '#f5f5f5',
+                        borderRadius: 1
+                      }}>
+                        {conflict.localContent?.substring(0, 200)}...
+                      </Typography>
+                    </Box>
+                    <Box sx={{ flex: 1 }}>
+                      <Typography variant="subtitle2" color="secondary">Server Version</Typography>
+                      <Typography variant="body2" sx={{ 
+                        maxHeight: 100, 
+                        overflow: 'auto', 
+                        p: 1, 
+                        bgcolor: '#f5f5f5',
+                        borderRadius: 1
+                      }}>
+                        {conflict.serverContent?.substring(0, 200)}...
+                      </Typography>
+                    </Box>
+                  </Box>
+                </Box>
+              ))}
+            </>
+          )}
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => {
+            // Keep local versions
+            setShowConflictDialog(false);
+            setConflicts([]);
+            console.log('✅ User chose to keep local versions');
+          }}>
+            Keep Local Changes
+          </Button>
+          <Button onClick={() => {
+            // Accept server versions
+            setShowConflictDialog(false);
+            setConflicts([]);
+            console.log('✅ User chose to accept server versions');
+            // TODO: Implement server version acceptance
+          }} variant="contained">
+            Use Server Changes
           </Button>
         </DialogActions>
       </Dialog>

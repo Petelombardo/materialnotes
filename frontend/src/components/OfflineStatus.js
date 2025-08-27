@@ -71,46 +71,7 @@ const OfflineStatus = () => {
     setShowOfflineAlert(false);
   };
 
-  return (
-    <Snackbar
-      open={showOfflineAlert && !isOnline}
-      anchorOrigin={{ 
-        vertical: 'bottom', 
-        horizontal: 'left' 
-      }}
-      sx={{
-        // Position to avoid FAB on mobile
-        bottom: isMobile ? 88 : 24, // Extra space when FAB is present
-        left: 24,
-        right: isMobile ? 88 : 'auto', // Leave space for FAB
-        '& .MuiSnackbarContent-root': {
-          maxWidth: isMobile ? 'calc(100vw - 112px)' : '400px'
-        }
-      }}
-    >
-      <Alert 
-        severity="warning" 
-        onClose={handleDismiss}
-        action={
-          <Button 
-            color="inherit" 
-            size="small" 
-            onClick={handleRetryConnection}
-            disabled={syncInProgress}
-          >
-            {syncInProgress ? 'Syncing...' : 'Retry'}
-          </Button>
-        }
-        sx={{
-          '& .MuiAlert-message': {
-            fontSize: isMobile ? '0.875rem' : '1rem'
-          }
-        }}
-      >
-        You're offline. Your notes are saved locally and will sync when connection is restored.
-      </Alert>
-    </Snackbar>
-  );
+  return null;
 };
 
 export default OfflineStatus;

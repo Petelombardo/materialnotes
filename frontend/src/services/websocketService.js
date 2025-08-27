@@ -12,6 +12,12 @@ class WebSocketService {
     this.connectionQuality = 'unknown';
     this.lastPingTime = null;
     this.reconnectTimer = null;
+    this.serverConnectionId = null; // Store server's custom connectionId
+    
+    // Expose WebSocket service globally for API integration
+    if (typeof window !== 'undefined') {
+      window.websocketService = this;
+    }
   }
 
   // Schedule reconnection with backoff
@@ -66,7 +72,11 @@ class WebSocketService {
       this.socket.disconnect();
       this.socket = null;
       this.connected = false;
+      this.serverConnectionId = null; // Clear server connectionId on disconnect
     }
+    
+    // Always reset connection flag on disconnect
+    this._isConnecting = false;
   }
 
   // Manual reconnection method
@@ -82,13 +92,32 @@ class WebSocketService {
   }
 
   async connect(token) {
-    if (this.socket) {
-      console.log('🔌 Disconnecting existing WebSocket connection');
-      this.socket.disconnect();
-      this.socket = null;
+    // CRITICAL: Prevent multiple simultaneous connection attempts at service level
+    if (this._isConnecting) {
+      console.log('🔒 WebSocket connection already in progress, waiting for existing attempt');
+      return new Promise((resolve, reject) => {
+        const checkConnection = () => {
+          if (this.connected && this.socket) {
+            resolve();
+          } else if (!this._isConnecting) {
+            reject(new Error('Connection attempt failed'));
+          } else {
+            setTimeout(checkConnection, 100);
+          }
+        };
+        checkConnection();
+      });
     }
-
+    
+    this._isConnecting = true;
+    
     try {
+      if (this.socket) {
+        console.log('🔌 Disconnecting existing WebSocket connection');
+        this.socket.removeAllListeners(); // CRITICAL: Remove all listeners to prevent cascading events
+        this.socket.disconnect();
+        this.socket = null;
+      }
       // Determine the WebSocket URL based on current location
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       const host = window.location.hostname;
@@ -108,33 +137,34 @@ class WebSocketService {
         auth: {
           token: token
         },
-        // Enhanced mobile configuration
+        // Improved configuration for stability
         transports: ['websocket', 'polling'],
         upgrade: true,
-        rememberUpgrade: false, // Don't remember upgrades for mobile reliability
-        timeout: 15000, // Increased timeout for mobile networks
+        rememberUpgrade: true, // Remember successful upgrades for better performance
+        timeout: 20000, // Longer timeout to reduce connection failures
         autoConnect: true,
         
-        // Enhanced reconnection for mobile
+        // Conservative reconnection settings for stability
         reconnection: true,
-        reconnectionAttempts: 8, // More attempts for mobile
-        reconnectionDelay: 2000, // Longer initial delay
-        reconnectionDelayMax: 10000, // Longer max delay
-        randomizationFactor: 0.5, // Add randomization to avoid thundering herd
+        reconnectionAttempts: 5,
+        reconnectionDelay: 3000,
+        reconnectionDelayMax: 15000,
+        randomizationFactor: 0.3, // Less randomization for more predictable behavior
         
-        // Mobile-specific options
-        forceNew: true, // Force new connection
-        multiplex: false, // Disable multiplexing for reliability
+        // Stability-focused options
+        forceNew: false, // Allow connection reuse for better stability
+        multiplex: true, // Enable multiplexing for efficiency
         
-        // Enhanced ping/pong for mobile
-        pingTimeout: 120000, // 2 minutes - longer for mobile networks
-        pingInterval: 30000 // 30 seconds - more frequent checks
+        // Stable ping/pong settings
+        pingTimeout: 180000, // 3 minutes - generous for stability
+        pingInterval: 45000 // 45 seconds - reasonable frequency
       });
 
       return new Promise((resolve, reject) => {
         const timeout = setTimeout(() => {
+          this._isConnecting = false; // Unlock connection on timeout
           reject(new Error('WebSocket connection timeout'));
-        }, this.isMobile ? 20000 : 15000); // Longer timeout for mobile
+        }, 25000); // Generous timeout for all devices to improve stability
 
         this.socket.on('connect', () => {
           clearTimeout(timeout);
@@ -143,6 +173,13 @@ class WebSocketService {
           this.reconnectAttempts = 0;
           this.lastPingTime = Date.now();
           this.connectionQuality = 'good';
+          this._isConnecting = false; // Unlock connection
+          
+          // Sync with API service connectivity
+          if (typeof window !== 'undefined' && window.apiService) {
+            window.apiService.setOnlineStatus(true, 'websocket');
+          }
+          
           this.emit('connection-restored');
           resolve();
         });
@@ -152,6 +189,7 @@ class WebSocketService {
           console.error('❌ WebSocket connection error:', error.message || error);
           this.connected = false;
           this.connectionQuality = 'poor';
+          this._isConnecting = false; // Unlock connection on error
           this.emit('connection-failed');
           reject(error);
         });
@@ -162,19 +200,20 @@ class WebSocketService {
           this.connectionQuality = reason === 'transport close' ? 'poor' : 'unknown';
           this.emit('connection-lost');
           
-          // Enhanced mobile reconnection logic
+          // More stable reconnection logic - let Socket.IO handle most reconnections automatically
           if (reason === 'io server disconnect') {
-            // Server disconnected, try to reconnect immediately
-            console.log('🔄 Server disconnected, attempting immediate reconnection...');
+            // Server intentionally disconnected, wait longer before reconnecting
+            console.log('🔄 Server disconnected, waiting before reconnection...');
             setTimeout(() => {
-              if (!this.connected) {
+              if (!this.connected && this.socket) {
+                console.log('🔄 Attempting scheduled reconnection after server disconnect...');
                 this.socket.connect();
               }
-            }, this.isMobile ? 3000 : 1000);
+            }, 5000); // Wait 5 seconds for server disconnect
           } else if (reason === 'transport close' || reason === 'transport error') {
-            // Network issues, wait before reconnecting
-            console.log('🔄 Network issue detected, waiting before reconnection...');
-            this.scheduleReconnection();
+            // Network issues - let Socket.IO handle automatic reconnection
+            console.log('🔄 Network issue detected, relying on automatic reconnection...');
+            // Don't manually trigger reconnection - let Socket.IO's built-in logic handle it
           }
         });
 
@@ -250,8 +289,15 @@ class WebSocketService {
           this.emit('heartbeat-ack', data);
         });
 
+        this.socket.on('batch-saved', (data) => {
+          this.emit('batch-saved', data);
+        });
+
         this.socket.on('connection-confirmed', (data) => {
           console.log('✅ Connection confirmed from server:', data);
+          // Store the server's custom connectionId for boomerang prevention
+          this.serverConnectionId = data.connectionId;
+          console.log('🔗 Stored server connectionId:', this.serverConnectionId);
           this.emit('connection-confirmed', data);
         });
 
@@ -264,18 +310,16 @@ class WebSocketService {
     } catch (error) {
       console.error('❌ Failed to create WebSocket connection:', error);
       this.connected = false;
+      this._isConnecting = false; // Unlock connection on outer catch
       throw error;
+    } finally {
+      // Always ensure connection flag is reset
+      if (!this.connected) {
+        this._isConnecting = false;
+      }
     }
   }
 
-  disconnect() {
-    if (this.socket) {
-      console.log('🔌 Disconnecting WebSocket');
-      this.socket.disconnect();
-      this.socket = null;
-      this.connected = false;
-    }
-  }
 
   // Event emitter methods
   on(event, handler) {
@@ -403,7 +447,8 @@ shouldUseWebSocket() {
   }
 
   getConnectionId() {
-    return this.socket ? this.socket.id : null;
+    // Return server's custom connectionId for boomerang prevention, fallback to socket.id
+    return this.serverConnectionId || (this.socket ? this.socket.id : null);
   }
 }
 

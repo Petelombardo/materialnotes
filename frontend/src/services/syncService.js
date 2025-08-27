@@ -1,5 +1,6 @@
 // src/services/syncService.js - Complete file
 import api from '../utils/api';
+import offlineStorage from '../utils/offlineStorage';
 
 class SyncService {
   constructor() {
@@ -8,9 +9,27 @@ class SyncService {
     this.pendingNotes = new Set();
   }
   
+  // Normalize content to prevent hash differences from whitespace/formatting
+  normalizeContent(content) {
+    if (!content) return '';
+    return content
+      .replace(/\r\n/g, '\n')                    // Normalize line endings (Windows)
+      .replace(/\r/g, '\n')                     // Handle old Mac line endings  
+      .replace(/\s+$/gm, '')                    // Remove trailing whitespace from each line
+      .replace(/(<p><\/p>)+/g, '')              // Remove empty paragraphs anywhere (not just end)
+      .replace(/(<p><br><\/p>)+/g, '')          // Remove paragraphs containing only <br>
+      .replace(/(<p>\s*<\/p>)+/g, '')           // Remove paragraphs with only whitespace
+      .replace(/>\s+</g, '><')                  // Remove whitespace between tags
+      .replace(/\s+/g, ' ')                     // Normalize multiple spaces to single space
+      .trim();                                  // Remove leading/trailing whitespace
+  }
+
   // Generate content hash for change detection (client-side)
   async generateContentHash(title, content) {
-    const combined = `${title || ''}|||${content || ''}`;
+    // CRITICAL: Normalize content before hashing to match server behavior
+    const normalizedContent = this.normalizeContent(content || '');
+    const normalizedTitle = (title || '').trim();
+    const combined = `${normalizedTitle}|||${normalizedContent}`;
     
     // Use Web Crypto API with SHA-256 (MD5 not supported in browsers)
     const encoder = new TextEncoder();
@@ -29,7 +48,9 @@ class SyncService {
     }
 
     this.syncInProgress = true;
-    console.log(`⚡ Starting INTELLIGENT bulk sync for ${notes.length} notes`);
+    if (process.env.NODE_ENV === 'development') {
+      console.log(`⚡ Starting INTELLIGENT bulk sync for ${notes.length} notes`);
+    }
 
     try {
       const results = {
@@ -47,7 +68,9 @@ class SyncService {
       };
 
       // STEP 1: Create client metadata map with hashes
-      console.log('🔄 Step 1: Building client metadata map...');
+      if (process.env.NODE_ENV === 'development') {
+        console.log('🔄 Step 1: Building client metadata map...');
+      }
       const clientMetadata = {};
       
       // Generate hashes for all notes in parallel
@@ -71,17 +94,23 @@ class SyncService {
         clientMetadata[result.id] = result.metadata;
       });
       
-      console.log(`✅ Built metadata for ${Object.keys(clientMetadata).length} notes`);
+      if (process.env.NODE_ENV === 'development') {
+        console.log(`✅ Built metadata for ${Object.keys(clientMetadata).length} notes`);
+      }
 
       // STEP 2: Get server metadata in ONE API call
-      console.log('🔄 Step 2: Fetching server metadata...');
+      if (process.env.NODE_ENV === 'development') {
+        console.log('🔄 Step 2: Fetching server metadata...');
+      }
       let serverResponse;
       try {
         // Try new efficient endpoint first
         serverResponse = await api.get('/api/notes/sync-metadata');
         console.log('Actual serverResponse object:', serverResponse); 
         results.stats.serverCalls++;
-        console.log(`✅ Server metadata received for ${serverResponse.data.count} notes`);
+        if (process.env.NODE_ENV === 'development') {
+          console.log(`✅ Server metadata received for ${serverResponse.data.count} notes`);
+        }
       } catch (error) {
         console.warn('⚠️ New sync-metadata endpoint not available, trying bulk-sync fallback...');
         console.error('Full error object:', error);
@@ -92,28 +121,138 @@ class SyncService {
             timestamps[note.id] = note.updatedAt || new Date(0).toISOString();
           });
           
+          // Generate/retrieve client ID for enhanced conflict detection
+          const clientId = localStorage.getItem('clientId') || (() => {
+            const newClientId = `client_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+            localStorage.setItem('clientId', newClientId);
+            return newClientId;
+          })();
+          
           const bulkResponse = await api.post('/api/notes/bulk-sync', {
-            noteTimestamps: timestamps
+            noteTimestamps: timestamps,
+            clientId: clientId
           });
           results.stats.serverCalls++;
           
-          console.log(`✅ Bulk sync fallback returned ${bulkResponse.data.updatedNotes?.length || 0} updates`);
+          console.log(`✅ Bulk sync fallback returned ${Object.keys(bulkResponse.data.updates || {}).length} updates`);
+          
+          // Process enhanced conflict detection if available
+          const updatedNotes = [];
+          const conflicts = [];
+          
+          for (const [noteId, updateData] of Object.entries(bulkResponse.data.updates || {})) {
+            console.log(`🔍 Processing bulk sync update for note ${noteId}:`, {
+              hasEnhancedMetadata: !!(updateData.syncMetadata && updateData.syncMetadata.canDetectConflicts),
+              serverHash: updateData.contentHash?.substring(0, 8) || updateData.syncMetadata?.serverHash?.substring(0, 8),
+              clientLastKnownHash: updateData.syncMetadata?.clientLastKnownHash?.substring(0, 8)
+            });
+            
+            if (updateData.syncMetadata && updateData.syncMetadata.canDetectConflicts) {
+              // Enhanced conflict detection available
+              const hasLocalChanges = await offlineStorage.hasOfflineChanges(noteId);
+              const serverHash = updateData.syncMetadata.serverHash;
+              const clientLastKnownHash = updateData.syncMetadata.clientLastKnownHash;
+              
+              const hasServerChanges = serverHash !== clientLastKnownHash;
+              
+              console.log(`🔍 Enhanced conflict detection for note ${noteId}:`, {
+                hasLocalChanges,
+                hasServerChanges,
+                serverHash: serverHash?.substring(0, 8),
+                clientLastKnownHash: clientLastKnownHash?.substring(0, 8),
+                bothSidesChanged: hasLocalChanges && hasServerChanges
+              });
+              
+              if (hasLocalChanges && hasServerChanges) {
+                // True conflict - both sides changed, get local content for comparison
+                const localNote = notes.find(n => n.id === noteId);
+                conflicts.push({
+                  noteId,
+                  serverContent: updateData.content,
+                  serverTitle: updateData.title,
+                  serverUpdatedAt: updateData.updatedAt,
+                  localContent: localNote?.content,
+                  localTitle: localNote?.title,
+                  localUpdatedAt: localNote?.updatedAt,
+                  conflictReason: 'both_sides_modified'
+                });
+                console.log(`⚠️ True conflict detected for note ${noteId}`);
+              } else if (hasLocalChanges && !hasServerChanges) {
+                // Only local changes - need to push to server
+                console.log(`📤 Local-only changes for note ${noteId} - need to push to server`);
+                // Skip adding to updatedNotes - local version should be preserved and synced
+                // TODO: Add to a "needsPush" array to trigger sync
+              } else if (hasServerChanges) {
+                // Only server changed - safe to update
+                updatedNotes.push(updateData);
+                console.log(`✅ Server-only changes for note ${noteId} - safe to update`);
+              } else {
+                // No changes on either side - already in sync
+                console.log(`✅ Note ${noteId} is in sync`);
+              }
+            } else {
+              // Fallback to old timestamp-based detection with offline change check
+              console.log(`📊 Using fallback conflict detection for note ${noteId}`);
+              
+              const hasLocalChanges = await offlineStorage.hasOfflineChanges(noteId);
+              console.log(`🔍 Fallback: Note ${noteId} hasLocalChanges:`, hasLocalChanges);
+              
+              if (hasLocalChanges) {
+                // Local changes exist - should not overwrite with server data
+                console.log(`📤 Fallback: Local changes detected for note ${noteId} - skipping server update to preserve local changes`);
+                // Don't add to updatedNotes - preserve local version
+              } else {
+                // No local changes - safe to update with server data
+                updatedNotes.push(updateData);
+                console.log(`✅ Fallback: No local changes for note ${noteId} - safe to update with server data`);
+              }
+            }
+          }
           
           return {
-            updatedNotes: bulkResponse.data.updatedNotes || [],
-            conflicts: bulkResponse.data.conflicts || [],
+            updatedNotes,
+            conflicts,
             errors: [],
             deletedNoteIds: [],
             stats: {
               ...results.stats,
-              foundUpdates: bulkResponse.data.updatedNotes?.length || 0,
+              foundUpdates: updatedNotes.length,
+              foundConflicts: conflicts.length,
               serverCalls: results.stats.serverCalls
             }
           };
           
         } catch (bulkError) {
-          console.error('❌ Both new and bulk-sync endpoints failed, falling back to legacy method:', bulkError);
-          return await this.syncAllNotesLegacy(notes, currentUser);
+          console.error('❌ Both new and bulk-sync endpoints failed:', bulkError);
+          
+          // Check if this is actually an offline error vs server error
+          if (bulkError.message && bulkError.message.includes('Offline:')) {
+            console.log('🔄 Detected offline state, using basic timestamp comparison');
+            // Return notes that might need checking based on timestamps only
+            const potentialUpdates = notes.filter(note => {
+              // Check if note might have updates based on rough heuristics
+              const timeSinceUpdate = Date.now() - new Date(note.updatedAt || 0).getTime();
+              return timeSinceUpdate > 60000; // Notes older than 1 minute might have updates
+            });
+            
+            return {
+              updatedNotes: [],
+              conflicts: [],
+              errors: [{ error: 'Operating in limited offline mode - sync limited' }],
+              deletedNoteIds: [],
+              stats: {
+                ...results.stats,
+                totalNotes: notes.length,
+                serverCalls: results.stats.serverCalls,
+                skipped: notes.length - potentialUpdates.length,
+                potentialUpdates: potentialUpdates.length
+              }
+            };
+          } else {
+            // For other errors, try legacy method
+            console.log('🔄 Non-offline error, trying legacy bulk sync...');
+            return await this.syncAllNotesLegacy(notes, currentUser);
+          }
         }
       }
 
@@ -122,7 +261,9 @@ class SyncService {
       const serverNoteIds = new Set(Object.keys(serverMetadata));
       
       // STEP 3: Intelligent filtering - find notes that actually changed
-      console.log('🔄 Step 3: Intelligent change detection...');
+      if (process.env.NODE_ENV === 'development') {
+        console.log('🔄 Step 3: Intelligent change detection...');
+      }
       const notesToFetch = [];
       
       // Check each server note
@@ -189,7 +330,9 @@ class SyncService {
           }
         }
       } else {
+        if (process.env.NODE_ENV === 'development') {
         console.log('✅ No notes need fetching - all up to date!');
+      }
       }
 
       // Combine updated and new notes
@@ -198,17 +341,20 @@ class SyncService {
       const efficiency = results.stats.checked > 0 ? 
         Math.round((results.stats.skipped / results.stats.checked) * 100) : 0;
 
-      console.log('✅ INTELLIGENT bulk sync complete:', {
-        totalNotes: results.stats.totalNotes,
-        serverCalls: results.stats.serverCalls,
-        updated: results.updatedNotes.length,
-        new: results.newNotes.length,
-        deleted: results.deletedNoteIds.length,
-        skipped: results.stats.skipped,
-        efficiency: `${efficiency}% skipped`,
-        conflicts: results.conflicts.length,
-        errors: results.errors.length
-      });
+      const hasChanges = results.updatedNotes.length > 0 || results.newNotes.length > 0;
+      if (hasChanges || process.env.NODE_ENV === 'development') {
+        console.log('✅ INTELLIGENT bulk sync complete:', {
+          totalNotes: results.stats.totalNotes,
+          serverCalls: results.stats.serverCalls,
+          updated: results.updatedNotes.length,
+          new: results.newNotes.length,
+          deleted: results.deletedNoteIds.length,
+          skipped: results.stats.skipped,
+          efficiency: `${efficiency}% skipped`,
+          conflicts: results.conflicts.length,
+          errors: results.errors.length
+        });
+      }
 
       this.lastGlobalSync = Date.now();
       return {
@@ -227,7 +373,7 @@ class SyncService {
     }
   }
   
-  // Legacy fallback method (old approach)
+  // Legacy fallback method (old approach) - ENHANCED with offline handling
   async syncAllNotesLegacy(notes, currentUser) {
     console.log('🔄 Using LEGACY bulk sync approach...');
     
@@ -237,8 +383,37 @@ class SyncService {
       errors: []
     };
 
+    // Check connectivity before proceeding
+    let isOnline = true;
+    try {
+      const api = (await import('../utils/api')).default;
+      isOnline = await api.forceConnectivityTest();
+    } catch (error) {
+      console.log('⚠️ Connectivity test failed in legacy sync');
+      isOnline = false;
+    }
+
+    if (!isOnline) {
+      console.log('📴 Legacy sync detected offline state - returning cached notes only');
+      return {
+        updatedNotes: [],
+        conflicts: [],
+        errors: [{ error: 'Legacy sync: offline mode - no server communication possible' }],
+        stats: {
+          totalNotes: notes.length,
+          serverCalls: 0,
+          updated: 0,
+          conflicts: 0,
+          errors: 1,
+          skipped: notes.length
+        }
+      };
+    }
+
     // Process notes in parallel but limit concurrency
-    const batchSize = 5;
+    const batchSize = 3; // Reduced batch size for more reliable processing
+    let offlineErrorCount = 0;
+    
     for (let i = 0; i < notes.length; i += batchSize) {
       const batch = notes.slice(i, i + batchSize);
       const batchPromises = batch.map(note => this.checkNoteForUpdates(note, currentUser));
@@ -252,6 +427,11 @@ class SyncService {
           
           if (error) {
             results.errors.push({ noteId: note.id, error });
+            
+            // Count offline errors to determine if we should stop
+            if (error.includes('Offline:')) {
+              offlineErrorCount++;
+            }
           } else if (conflict) {
             results.conflicts.push({ note, conflict });
           } else if (hasUpdates && updatedNote) {
@@ -265,9 +445,15 @@ class SyncService {
         }
       });
 
+      // If too many offline errors, stop processing
+      if (offlineErrorCount >= 3) {
+        console.log('❌ Too many offline errors in legacy sync, stopping early');
+        break;
+      }
+
       // Small delay between batches to avoid overwhelming the server
       if (i + batchSize < notes.length) {
-        await new Promise(resolve => setTimeout(resolve, 100));
+        await new Promise(resolve => setTimeout(resolve, 200)); // Slightly longer delay
       }
     }
 
@@ -275,19 +461,33 @@ class SyncService {
       totalNotes: notes.length,
       updated: results.updatedNotes.length,
       conflicts: results.conflicts.length,
-      errors: results.errors.length
+      errors: results.errors.length,
+      offlineErrors: offlineErrorCount
     });
 
-    return results;
+    return {
+      ...results,
+      stats: {
+        totalNotes: notes.length,
+        serverCalls: Math.min(notes.length, Math.max(0, notes.length - offlineErrorCount)),
+        updated: results.updatedNotes.length,
+        conflicts: results.conflicts.length,
+        errors: results.errors.length
+      }
+    };
   }
 
-  // Check a single note for updates
+  // Check a single note for updates with enhanced conflict detection
   async checkNoteForUpdates(note, currentUser) {
     try {
       console.log(`🔍 Checking note ${note.id} for updates since ${note.updatedAt}`);
       
+      // First, check if we have offline changes that need conflict detection
+      const offlineStorage = (await import('../utils/offlineStorage')).default;
+      const offlineChanges = await offlineStorage.checkForOfflineChanges(note);
+      
       const response = await api.get(`/api/notes/${note.id}/updates?since=${note.updatedAt}`);
-      const { content, title, updatedAt, lastEditor } = response.data;
+      const { content, title, updatedAt, lastEditor, contentHash: serverHash } = response.data;
 
       console.log(`🔍 Server response for note ${note.id}:`, {
         hasContent: !!content,
@@ -297,7 +497,9 @@ class SyncService {
         title: title,
         serverUpdatedAt: updatedAt,
         noteUpdatedAt: note.updatedAt,
-        lastEditor: lastEditor?.name || 'Unknown'
+        lastEditor: lastEditor?.name || 'Unknown',
+        serverHash,
+        offlineChanges: offlineChanges.hasChanges
       });
 
       // No updates if server timestamp is same or older
@@ -323,21 +525,43 @@ class SyncService {
         titleChanged: note.title !== title
       });
 
-      // Check if there might be local changes that would conflict
-      const hasLocalChanges = this.pendingNotes.has(note.id);
-
+      // ENHANCED CONFLICT DETECTION: Check if we have local changes AND server changed
+      const hasLocalChanges = this.pendingNotes.has(note.id) || offlineChanges.hasChanges;
+      
       if (hasLocalChanges) {
-        console.log(`⚠️ Potential conflict detected for note ${note.id}`);
-        return {
-          hasUpdates: true,
-          conflict: {
-            localNote: note,
-            remoteContent: content,
-            remoteTitle: title,
-            remoteUpdatedAt: updatedAt,
-            lastEditor
-          }
-        };
+        // Compare original hash with server hash to detect conflicts
+        const originalHash = offlineChanges.originalHash || note.originalHash;
+        const currentServerHash = serverHash || await this.generateContentHash(title, content);
+        
+        console.log(`🔍 Conflict analysis for note ${note.id}:`, {
+          hasLocalChanges,
+          originalHash,
+          currentServerHash,
+          hashesMatch: originalHash === currentServerHash,
+          currentLocalHash: offlineChanges.currentHash
+        });
+        
+        // If original hash matches server hash, safe to sync (user's changes on top of same base)
+        if (originalHash && originalHash === currentServerHash) {
+          console.log(`✅ Safe to sync note ${note.id} - user changed same version as server`);
+          // Proceed with normal update
+        } else {
+          console.log(`⚠️ CONFLICT detected for note ${note.id} - both client and server changed from different base versions`);
+          return {
+            hasUpdates: true,
+            conflict: {
+              localNote: note,
+              remoteContent: content,
+              remoteTitle: title,
+              remoteUpdatedAt: updatedAt,
+              lastEditor,
+              originalHash,
+              serverHash: currentServerHash,
+              localHash: offlineChanges.currentHash,
+              conflictType: 'hash_mismatch'
+            }
+          };
+        }
       }
 
       // No conflict - return updated note
@@ -348,7 +572,8 @@ class SyncService {
         updatedAt,
         lastEditedBy: lastEditor?.id,
         lastEditorName: lastEditor?.name,
-        lastEditorAvatar: lastEditor?.avatar
+        lastEditorAvatar: lastEditor?.avatar,
+        originalHash: serverHash || await this.generateContentHash(title, content) // Update original hash after sync
       };
       
       console.log(`✅ Returning updated note ${note.id}:`, {
